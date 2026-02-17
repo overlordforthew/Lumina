@@ -18,7 +18,7 @@ const pool = new Pool({
 
 const JWT_SECRET = process.env.JWT_SECRET || 'lumina-change-this-secret-in-production';
 const PORT = process.env.PORT || 3456;
-const BASE = '/lumina';
+const BASE = '';
 
 // ─── AUTH MIDDLEWARE ───
 function auth(req, res, next) {
