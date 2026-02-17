@@ -1,0 +1,39 @@
+version: "3.8"
+
+services:
+  # ─── LUMINA's own PostgreSQL database ───
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: lumina
+      POSTGRES_USER: lumina
+      POSTGRES_PASSWORD: ${DB_PASS:-lumina_change_me}
+    volumes:
+      - lumina_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lumina"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ─── LUMINA Node.js app ───
+  app:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3456:3456"
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: lumina
+      DB_USER: lumina
+      DB_PASS: ${DB_PASS:-lumina_change_me}
+      JWT_SECRET: ${JWT_SECRET:-change-this-to-random-string}
+      PORT: 3456
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  lumina_pgdata:

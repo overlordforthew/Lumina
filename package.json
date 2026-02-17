@@ -1,0 +1,22 @@
+{
+  "name": "lumina",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build": "esbuild src/app.jsx --bundle --outfile=public/app.js --define:process.env.NODE_ENV='\"production\"' --minify",
+    "start": "node server.js",
+    "setup-db": "node setup-db.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "pg": "^8.11.3",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.2",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "esbuild": "^0.19.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  }
+}
