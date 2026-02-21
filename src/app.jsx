@@ -7,7 +7,7 @@ import { createRoot } from "react-dom/client";
 // ═══════════════════════════════════════════════════════
 
 // ─── API HELPER ───
-var API_BASE = "/lumina/api";
+var API_BASE = "/api";
 var api = {
   token: (typeof localStorage !== "undefined") ? localStorage.getItem("lumina_token") : null,
   async req(method, path, body) {
