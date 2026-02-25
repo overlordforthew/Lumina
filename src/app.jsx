@@ -51,7 +51,6 @@ var api = {
   },
 };
 
-var CATS = ["spiritual", "self-love", "financial", "growth"];
 var CAT_INFO = {
   spiritual: { label: "Spiritual", labelJa: "\u30B9\u30D4\u30EA\u30C1\u30E5\u30A2\u30EB", color: "#9b7fd4", bg: "#f0eaf8", accent: "#7c5cbf" },
   financial: { label: "Financial", labelJa: "\u30D5\u30A1\u30A4\u30CA\u30F3\u30B9", color: "#6aaa6e", bg: "#eaf5eb", accent: "#4a8f4e" },
@@ -1208,7 +1207,7 @@ function WatercolorArt(props) {
   var motif;
   if (motifIdx === 0) motif = <g><circle cx="100" cy="80" r="18" fill={color} opacity=".2"/><path d="M100 62 Q92 50 88 38" fill="none" stroke={accent} strokeWidth="2" opacity=".4"/><path d="M100 62 Q108 48 114 36" fill="none" stroke={accent} strokeWidth="2" opacity=".4"/><ellipse cx="86" cy="34" rx="6" ry="9" fill={color} opacity=".2" transform="rotate(-20,86,34)"/><ellipse cx="116" cy="32" rx="6" ry="9" fill={color} opacity=".2" transform="rotate(20,116,32)"/><circle cx="92" cy="46" r="2" fill={accent} opacity=".3"/><circle cx="108" cy="44" r="2" fill={accent} opacity=".3"/></g>;
   else if (motifIdx === 1) motif = <g><ellipse cx="100" cy="80" rx="22" ry="28" fill={color} opacity=".12" /><ellipse cx="100" cy="80" rx="16" ry="22" fill="white" opacity=".3"/><circle cx="94" cy="74" r="4" fill={accent} opacity=".2"/><circle cx="106" cy="74" r="4" fill={accent} opacity=".2"/></g>;
-  else if (motifIdx === 2) motif = <g><circle cx="85" cy="70" r="14" fill={color} opacity=".15" stroke={accent} strokeWidth="1" opacity=".2"/><circle cx="115" cy="85" r="12" fill={accent} opacity=".12"/><circle cx="95" cy="95" r="10" fill={color} opacity=".1"/><path d="M85 56 Q100 50 115 73" fill="none" stroke={color} strokeWidth="1.5" opacity=".15" strokeDasharray="4,3"/></g>;
+  else if (motifIdx === 2) motif = <g><circle cx="85" cy="70" r="14" fill={color} opacity=".15" stroke={accent} strokeWidth="1"/><circle cx="115" cy="85" r="12" fill={accent} opacity=".12"/><circle cx="95" cy="95" r="10" fill={color} opacity=".1"/><path d="M85 56 Q100 50 115 73" fill="none" stroke={color} strokeWidth="1.5" opacity=".15" strokeDasharray="4,3"/></g>;
   else if (motifIdx === 3) motif = <g><circle cx="100" cy="80" r="12" fill={color} opacity=".15"/><circle cx="100" cy="80" r="22" fill="none" stroke={accent} strokeWidth="1" opacity=".15" strokeDasharray="4,4"/><circle cx="100" cy="80" r="32" fill="none" stroke={color} strokeWidth=".8" opacity=".1" strokeDasharray="6,4"/></g>;
   else if (motifIdx === 4) motif = <g><circle cx="100" cy="70" r="10" fill={color} opacity=".12"/><path d="M100 80 L100 100" stroke={accent} strokeWidth="2" opacity=".2"/><path d="M88 88 L100 94 L112 88" fill="none" stroke={color} strokeWidth="1.5" opacity=".15"/></g>;
   else if (motifIdx === 5) motif = <g><path d="M100 100 Q82 86 82 72 Q82 62 92 62 Q98 62 100 68 Q102 62 108 62 Q118 62 118 72 Q118 86 100 100Z" fill={color} opacity=".15"/></g>;
@@ -1517,14 +1516,12 @@ function LuminaApp() {
   Object.keys(progress).forEach(function(k) { var n = Number(k); if (n > highestCompleted) highestCompleted = n; });
   var maxDay = testMode ? 90 : Math.max(dayFromStart, Math.min(highestCompleted + 1, 90));
   var activeDay = maxDay;
-  var foundUncompleted = false;
   for (var ad = 1; ad <= maxDay; ad++) {
-    if (!progress[ad]) { activeDay = ad; foundUncompleted = true; break; }
+    if (!progress[ad]) { activeDay = ad; break; }
   }
   // If all days completed, activeDay = maxDay (the last completed day)
   var handleSelectDay = function(d) { setSelDay(d); setView("lesson"); };
   var lessonDay = selDay || activeDay;
-  var lang = user ? user.lang : "en";
   // When switching to lesson tab via bottom nav, always go to current active day
   var handleTabClick = function(id) {
     if (id === "lesson") {
