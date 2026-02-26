@@ -4,6 +4,7 @@ const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const path = require('path');
+const nodemailer = require('nodemailer');
 
 const app = express();
 app.use(express.json({ limit: '15mb' }));
@@ -206,6 +207,72 @@ app.post(BASE + '/api/image/:day', auth, async (req, res) => {
   }
 });
 
+// ─── CONTACT FORM (public, CORS-enabled for namibarden.com) ───
+const CONTACT_EMAIL = process.env.CONTACT_EMAIL || 'namibarden@gmail.com';
+const contactRateLimit = new Map();
+
+app.options(BASE + '/api/contact', (req, res) => {
+  res.set({
+    'Access-Control-Allow-Origin': 'https://namibarden.com',
+    'Access-Control-Allow-Methods': 'POST',
+    'Access-Control-Allow-Headers': 'Content-Type',
+  });
+  res.sendStatus(204);
+});
+
+app.post(BASE + '/api/contact', async (req, res) => {
+  res.set('Access-Control-Allow-Origin', 'https://namibarden.com');
+  try {
+    const { name, email, subject, message } = req.body;
+    if (!name || !email || !message) {
+      return res.status(400).json({ error: 'Name, email, and message are required' });
+    }
+
+    // Simple rate limit: 3 submissions per IP per 10 minutes
+    const ip = req.ip;
+    const now = Date.now();
+    const recent = contactRateLimit.get(ip) || [];
+    const filtered = recent.filter(t => now - t < 600000);
+    if (filtered.length >= 3) {
+      return res.status(429).json({ error: 'Too many submissions. Please wait a few minutes.' });
+    }
+    filtered.push(now);
+    contactRateLimit.set(ip, filtered);
+
+    // Save to database
+    await pool.query(
+      'INSERT INTO contact_submissions (name, email, subject, message) VALUES ($1, $2, $3, $4)',
+      [name, email, subject || '', message]
+    );
+
+    // Send email if SMTP is configured
+    if (process.env.SMTP_USER && process.env.SMTP_PASS) {
+      const transporter = nodemailer.createTransport({
+        host: process.env.SMTP_HOST || 'smtp.gmail.com',
+        port: parseInt(process.env.SMTP_PORT) || 587,
+        secure: false,
+        auth: {
+          user: process.env.SMTP_USER,
+          pass: process.env.SMTP_PASS,
+        },
+      });
+      await transporter.sendMail({
+        from: `"NamiBarden.com Contact" <${process.env.SMTP_USER}>`,
+        replyTo: email,
+        to: CONTACT_EMAIL,
+        subject: subject ? `[Contact Form] ${subject}` : `[Contact Form] Message from ${name}`,
+        text: `Name: ${name}\nEmail: ${email}\nSubject: ${subject || '(none)'}\n\nMessage:\n${message}`,
+        html: `<p><strong>Name:</strong> ${name}</p><p><strong>Email:</strong> ${email}</p><p><strong>Subject:</strong> ${subject || '(none)'}</p><hr><p>${message.replace(/\n/g, '<br>')}</p>`,
+      });
+    }
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('Contact form error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // ─── SPA FALLBACK ───
 app.get(BASE + '/*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
@@ -245,6 +312,14 @@ async function initDB() {
         id SERIAL PRIMARY KEY,
         day_num INTEGER UNIQUE NOT NULL,
         image_data TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS contact_submissions (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        email VARCHAR(255) NOT NULL,
+        subject VARCHAR(500),
+        message TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
       );
     `);
     console.log('Database tables ready');
