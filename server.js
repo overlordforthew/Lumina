@@ -243,17 +243,26 @@ async function initDB() {
         image_data TEXT NOT NULL
       );
     `);
+
+    // Add indices for frequently queried columns
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+      CREATE INDEX IF NOT EXISTS idx_progress_user_id ON progress(user_id);
+      CREATE INDEX IF NOT EXISTS idx_audio_user_day ON audio(user_id, day_num);
+    `);
     console.log('Database tables ready');
 
-    // Create test user if not exists
-    const existing = await pool.query("SELECT id FROM users WHERE email = 'test@test.com'");
-    if (existing.rows.length === 0) {
-      const hash = await bcrypt.hash('test', 10);
-      await pool.query(
-        "INSERT INTO users (email, name, password_hash, lang, start_date) VALUES ('test@test.com', 'Test User', $1, 'en', CURRENT_DATE)",
-        [hash]
-      );
-      console.log('Test user created (test@test.com / test)');
+    // Create test user only in development
+    if (process.env.NODE_ENV !== 'production') {
+      const existing = await pool.query("SELECT id FROM users WHERE email = 'test@test.com'");
+      if (existing.rows.length === 0) {
+        const hash = await bcrypt.hash('test', 10);
+        await pool.query(
+          "INSERT INTO users (email, name, password_hash, lang, start_date) VALUES ('test@test.com', 'Test User', $1, 'en', CURRENT_DATE)",
+          [hash]
+        );
+        console.log('Test user created (test@test.com / test)');
+      }
     }
   } catch (e) {
     console.error('DB init error:', e.message);
