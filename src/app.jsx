@@ -856,13 +856,6 @@ function getLastCompletionTime(progress) {
   return latest || null;
 }
 
-function formatTimeRemaining(ms) {
-  var h = Math.floor(ms / 3600000);
-  var m = Math.ceil((ms % 3600000) / 60000);
-  if (h > 0) return h + "h " + m + "m";
-  return m + " minutes";
-}
-
 function playPlaceholderAudio() {
   try {
     var ctx = new (window.AudioContext || window.webkitAudioContext)();

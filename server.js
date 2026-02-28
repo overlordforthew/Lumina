@@ -18,7 +18,6 @@ const pool = new Pool({
 
 const JWT_SECRET = process.env.JWT_SECRET || 'lumina-change-this-secret-in-production';
 const PORT = process.env.PORT || 3456;
-const BASE = '';
 
 // ─── AUTH MIDDLEWARE ───
 function auth(req, res, next) {
@@ -35,10 +34,10 @@ function auth(req, res, next) {
 }
 
 // ─── STATIC FILES ───
-app.use(BASE, express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname, 'public')));
 
 // ─── AUTH ROUTES ───
-app.post(BASE + '/api/auth/signup', async (req, res) => {
+app.post('/api/auth/signup', async (req, res) => {
   try {
     const { email, name, password, lang } = req.body;
     if (!email || !name || !password) return res.status(400).json({ error: 'fillAll' });
@@ -63,7 +62,7 @@ app.post(BASE + '/api/auth/signup', async (req, res) => {
   }
 });
 
-app.post(BASE + '/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'fillAll' });
@@ -86,7 +85,7 @@ app.post(BASE + '/api/auth/login', async (req, res) => {
   }
 });
 
-app.get(BASE + '/api/auth/session', auth, async (req, res) => {
+app.get('/api/auth/session', auth, async (req, res) => {
   try {
     const result = await pool.query('SELECT id, email, name, lang, start_date FROM users WHERE id = $1', [req.user.id]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
@@ -99,7 +98,7 @@ app.get(BASE + '/api/auth/session', auth, async (req, res) => {
 });
 
 // ─── USER ROUTES ───
-app.put(BASE + '/api/user/lang', auth, async (req, res) => {
+app.put('/api/user/lang', auth, async (req, res) => {
   try {
     const { lang } = req.body;
     await pool.query('UPDATE users SET lang = $1 WHERE id = $2', [lang, req.user.id]);
@@ -111,7 +110,7 @@ app.put(BASE + '/api/user/lang', auth, async (req, res) => {
 });
 
 // ─── PROGRESS ROUTES ───
-app.get(BASE + '/api/progress', auth, async (req, res) => {
+app.get('/api/progress', auth, async (req, res) => {
   try {
     const result = await pool.query(
       'SELECT day_num, completed_at FROM progress WHERE user_id = $1 ORDER BY day_num',
@@ -129,7 +128,7 @@ app.get(BASE + '/api/progress', auth, async (req, res) => {
   }
 });
 
-app.post(BASE + '/api/progress/:day', auth, async (req, res) => {
+app.post('/api/progress/:day', auth, async (req, res) => {
   try {
     const dayNum = parseInt(req.params.day);
     if (isNaN(dayNum) || dayNum < 1 || dayNum > 90) {
@@ -147,7 +146,7 @@ app.post(BASE + '/api/progress/:day', auth, async (req, res) => {
 });
 
 // ─── AUDIO ROUTES ───
-app.get(BASE + '/api/audio/:day', auth, async (req, res) => {
+app.get('/api/audio/:day', auth, async (req, res) => {
   try {
     const dayNum = parseInt(req.params.day);
     const result = await pool.query(
@@ -162,7 +161,7 @@ app.get(BASE + '/api/audio/:day', auth, async (req, res) => {
   }
 });
 
-app.post(BASE + '/api/audio/:day', auth, async (req, res) => {
+app.post('/api/audio/:day', auth, async (req, res) => {
   try {
     const dayNum = parseInt(req.params.day);
     const { data } = req.body;
@@ -179,7 +178,7 @@ app.post(BASE + '/api/audio/:day', auth, async (req, res) => {
 });
 
 // ─── IMAGE ROUTES (admin-uploaded per-day images) ───
-app.get(BASE + '/api/image/:day', async (req, res) => {
+app.get('/api/image/:day', async (req, res) => {
   try {
     const dayNum = parseInt(req.params.day);
     const result = await pool.query('SELECT image_data FROM images WHERE day_num = $1', [dayNum]);
@@ -190,7 +189,7 @@ app.get(BASE + '/api/image/:day', async (req, res) => {
   }
 });
 
-app.post(BASE + '/api/image/:day', auth, async (req, res) => {
+app.post('/api/image/:day', auth, async (req, res) => {
   try {
     const dayNum = parseInt(req.params.day);
     const { data } = req.body;
@@ -207,10 +206,7 @@ app.post(BASE + '/api/image/:day', auth, async (req, res) => {
 });
 
 // ─── SPA FALLBACK ───
-app.get(BASE + '/*', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
-app.get(BASE, (req, res) => {
+app.get('/*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
@@ -264,8 +260,13 @@ async function initDB() {
   }
 }
 
-initDB().then(() => {
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`LUMINA server running on port ${PORT}`);
+// Allow setup-db.js to reuse pool and initDB without starting the server
+module.exports = { pool, initDB };
+
+if (require.main === module) {
+  initDB().then(() => {
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`LUMINA server running on port ${PORT}`);
+    });
   });
-});
+}
