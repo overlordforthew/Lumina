@@ -7,6 +7,10 @@ const path = require('path');
 
 const app = express();
 app.use(express.json({ limit: '15mb' }));
+app.use((err, req, res, next) => {
+  if (err.type === 'entity.parse.failed') return res.status(400).json({ error: 'Invalid JSON' });
+  next(err);
+});
 
 const pool = new Pool({
   host: process.env.DB_HOST || 'localhost',
@@ -149,6 +153,7 @@ app.post('/api/progress/:day', auth, async (req, res) => {
 app.get('/api/audio/:day', auth, async (req, res) => {
   try {
     const dayNum = parseInt(req.params.day);
+    if (isNaN(dayNum) || dayNum < 1 || dayNum > 90) return res.status(400).json({ error: 'Invalid day' });
     const result = await pool.query(
       'SELECT audio_data FROM audio WHERE user_id = $1 AND day_num = $2',
       [req.user.id, dayNum]
@@ -164,6 +169,7 @@ app.get('/api/audio/:day', auth, async (req, res) => {
 app.post('/api/audio/:day', auth, async (req, res) => {
   try {
     const dayNum = parseInt(req.params.day);
+    if (isNaN(dayNum) || dayNum < 1 || dayNum > 90) return res.status(400).json({ error: 'Invalid day' });
     const { data } = req.body;
     if (!data) return res.status(400).json({ error: 'No audio data' });
     await pool.query(
@@ -181,6 +187,7 @@ app.post('/api/audio/:day', auth, async (req, res) => {
 app.get('/api/image/:day', async (req, res) => {
   try {
     const dayNum = parseInt(req.params.day);
+    if (isNaN(dayNum) || dayNum < 1 || dayNum > 90) return res.status(400).json({ error: 'Invalid day' });
     const result = await pool.query('SELECT image_data FROM images WHERE day_num = $1', [dayNum]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'No image' });
     res.json({ data: result.rows[0].image_data });
@@ -192,6 +199,7 @@ app.get('/api/image/:day', async (req, res) => {
 app.post('/api/image/:day', auth, async (req, res) => {
   try {
     const dayNum = parseInt(req.params.day);
+    if (isNaN(dayNum) || dayNum < 1 || dayNum > 90) return res.status(400).json({ error: 'Invalid day' });
     const { data } = req.body;
     if (!data) return res.status(400).json({ error: 'No image data' });
     await pool.query(
