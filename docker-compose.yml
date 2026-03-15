@@ -21,6 +21,18 @@ services:
     restart: unless-stopped
     expose:
       - "3456"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.lumina.entrypoints=https"
+      - "traefik.http.routers.lumina.rule=Host(`lumina.namibarden.com`)"
+      - "traefik.http.routers.lumina.tls=true"
+      - "traefik.http.routers.lumina.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.lumina.middlewares=security-headers@file"
+      - "traefik.http.services.lumina.loadbalancer.server.port=3456"
+      - "traefik.docker.network=coolify"
+    networks:
+      - coolify
+      - default
     environment:
       DB_HOST: db
       DB_PORT: 5432
@@ -35,3 +47,7 @@ services:
 
 volumes:
   lumina_pgdata:
+
+networks:
+  coolify:
+    external: true
