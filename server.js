@@ -8,9 +8,6 @@ const logger = require('./lib/logger');
 const validateEnv = require('./lib/validate-env');
 const rateLimit = require('./lib/rate-limit');
 
-// Validate required environment variables before anything else
-validateEnv();
-
 const app = express();
 app.use(express.json({ limit: '15mb' }));
 app.use((err, req, res, next) => {
@@ -72,17 +69,17 @@ app.post('/api/auth/signup', signupLimiter, async (req, res) => {
 
     const hash = await bcrypt.hash(password, 10);
     const result = await pool.query(
-      'INSERT INTO users (email, name, password_hash, lang, start_date) VALUES ($1, $2, $3, $4, CURRENT_DATE) RETURNING id, email, name, lang, start_date',
+      'INSERT INTO users (email, name, password_hash, lang, start_date) VALUES ($1, $2, $3, $4, CURRENT_DATE) RETURNING id, email, name, lang, role, start_date',
       [email.toLowerCase(), name, hash, lang || 'en']
     );
     const u = result.rows[0];
-    const token = jwt.sign({ id: u.id, email: u.email }, JWT_SECRET, { expiresIn: '180d' });
+    const token = jwt.sign({ id: u.id, email: u.email, role: u.role || 'user' }, JWT_SECRET, { expiresIn: '180d' });
     res.json({
       token,
       user: { email: u.email, name: u.name, lang: u.lang, startDate: u.start_date }
     });
   } catch (e) {
-    console.error('Signup error:', e);
+    logger.error({ err: e }, 'Signup error');
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -99,13 +96,13 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
     const valid = await bcrypt.compare(password, u.password_hash);
     if (!valid) return res.status(401).json({ error: 'wrongPw' });
 
-    const token = jwt.sign({ id: u.id, email: u.email }, JWT_SECRET, { expiresIn: '180d' });
+    const token = jwt.sign({ id: u.id, email: u.email, role: u.role || 'user' }, JWT_SECRET, { expiresIn: '180d' });
     res.json({
       token,
       user: { email: u.email, name: u.name, lang: u.lang, startDate: u.start_date }
     });
   } catch (e) {
-    console.error('Login error:', e);
+    logger.error({ err: e }, 'Login error');
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -117,7 +114,7 @@ app.get('/api/auth/session', auth, async (req, res) => {
     const u = result.rows[0];
     res.json({ email: u.email, name: u.name, lang: u.lang, startDate: u.start_date });
   } catch (e) {
-    console.error('Session error:', e);
+    logger.error({ err: e }, 'Session error');
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -129,7 +126,7 @@ app.put('/api/user/lang', auth, async (req, res) => {
     await pool.query('UPDATE users SET lang = $1 WHERE id = $2', [lang, req.user.id]);
     res.json({ ok: true, lang });
   } catch (e) {
-    console.error('Update lang error:', e);
+    logger.error({ err: e }, 'Update lang error');
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -148,7 +145,7 @@ app.get('/api/progress', auth, async (req, res) => {
     });
     res.json(progress);
   } catch (e) {
-    console.error('Get progress error:', e);
+    logger.error({ err: e }, 'Get progress error');
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -165,7 +162,7 @@ app.post('/api/progress/:day', auth, async (req, res) => {
     );
     res.json({ ok: true, day: dayNum });
   } catch (e) {
-    console.error('Complete day error:', e);
+    logger.error({ err: e }, 'Complete day error');
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -182,7 +179,7 @@ app.get('/api/audio/:day', auth, async (req, res) => {
     if (result.rows.length === 0) return res.status(404).json({ error: 'No audio' });
     res.json({ data: result.rows[0].audio_data });
   } catch (e) {
-    console.error('Get audio error:', e);
+    logger.error({ err: e }, 'Get audio error');
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -199,7 +196,7 @@ app.post('/api/audio/:day', auth, async (req, res) => {
     );
     res.json({ ok: true });
   } catch (e) {
-    console.error('Save audio error:', e);
+    logger.error({ err: e }, 'Save audio error');
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -217,7 +214,7 @@ app.get('/api/image/:day', async (req, res) => {
   }
 });
 
-app.post('/api/image/:day', auth, async (req, res) => {
+app.post('/api/image/:day', auth, adminOnly, async (req, res) => {
   try {
     const dayNum = parseInt(req.params.day);
     if (isNaN(dayNum) || dayNum < 1 || dayNum > 90) return res.status(400).json({ error: 'Invalid day' });
@@ -229,7 +226,7 @@ app.post('/api/image/:day', auth, async (req, res) => {
     );
     res.json({ ok: true });
   } catch (e) {
-    console.error('Save image error:', e);
+    logger.error({ err: e }, 'Save image error');
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -249,6 +246,7 @@ async function initDB() {
         name VARCHAR(255) NOT NULL,
         password_hash VARCHAR(255) NOT NULL,
         lang VARCHAR(10) DEFAULT 'en',
+        role VARCHAR(20) DEFAULT 'user',
         start_date DATE DEFAULT CURRENT_DATE,
         created_at TIMESTAMP DEFAULT NOW()
       );
@@ -273,13 +271,18 @@ async function initDB() {
       );
     `);
 
+    // Add role column to existing databases (safe to run multiple times)
+    await pool.query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20) DEFAULT 'user';
+    `);
+
     // Add indices for frequently queried columns
     await pool.query(`
       CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
       CREATE INDEX IF NOT EXISTS idx_progress_user_id ON progress(user_id);
       CREATE INDEX IF NOT EXISTS idx_audio_user_day ON audio(user_id, day_num);
     `);
-    console.log('Database tables ready');
+    logger.info('Database tables ready');
 
     // Create test user only in development
     if (process.env.NODE_ENV !== 'production') {
@@ -290,11 +293,11 @@ async function initDB() {
           "INSERT INTO users (email, name, password_hash, lang, start_date) VALUES ('test@test.com', 'Test User', $1, 'en', CURRENT_DATE)",
           [hash]
         );
-        console.log('Test user created (test@test.com / test)');
+        logger.info('Test user created (test@test.com / test)');
       }
     }
   } catch (e) {
-    console.error('DB init error:', e.message);
+    logger.error({ err: e }, 'DB init error');
   }
 }
 
@@ -302,9 +305,11 @@ async function initDB() {
 module.exports = { pool, initDB };
 
 if (require.main === module) {
+  // Validate required environment variables before starting
+  validateEnv();
   initDB().then(() => {
     app.listen(PORT, '0.0.0.0', () => {
-      console.log(`LUMINA server running on port ${PORT}`);
+      logger.info({ port: PORT }, 'LUMINA server running');
     });
   });
 }

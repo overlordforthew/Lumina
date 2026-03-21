@@ -15,6 +15,7 @@ COPY package.json ./
 RUN npm install --omit=dev
 
 COPY server.js setup-db.js ./
+COPY lib/ ./lib/
 COPY public/ ./public/
 COPY --from=builder /app/public/app.js ./public/app.js
 
