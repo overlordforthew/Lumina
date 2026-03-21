@@ -4,6 +4,12 @@ const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const path = require('path');
+const logger = require('./lib/logger');
+const validateEnv = require('./lib/validate-env');
+const rateLimit = require('./lib/rate-limit');
+
+// Validate required environment variables before anything else
+validateEnv();
 
 const app = express();
 app.use(express.json({ limit: '15mb' }));
@@ -12,16 +18,23 @@ app.use((err, req, res, next) => {
   next(err);
 });
 
-const pool = new Pool({
-  host: process.env.DB_HOST || 'localhost',
-  port: process.env.DB_PORT || 5432,
-  database: process.env.DB_NAME || 'lumina',
-  user: process.env.DB_USER || 'lumina',
-  password: process.env.DB_PASS || 'lumina',
-});
+const pool = process.env.DATABASE_URL
+  ? new Pool({ connectionString: process.env.DATABASE_URL })
+  : new Pool({
+      host: process.env.DB_HOST,
+      port: process.env.DB_PORT || 5432,
+      database: process.env.DB_NAME,
+      user: process.env.DB_USER,
+      password: process.env.DB_PASS,
+    });
 
-const JWT_SECRET = process.env.JWT_SECRET || 'lumina-change-this-secret-in-production';
+// No fallback — validateEnv() guarantees JWT_SECRET exists
+const JWT_SECRET = process.env.JWT_SECRET;
 const PORT = process.env.PORT || 3456;
+
+// Rate limiters for auth routes
+const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, message: 'Too many login attempts, please try again later' });
+const signupLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 5, message: 'Too many signup attempts, please try again later' });
 
 // ─── AUTH MIDDLEWARE ───
 function auth(req, res, next) {
@@ -37,11 +50,19 @@ function auth(req, res, next) {
   }
 }
 
+// ─── ADMIN MIDDLEWARE ───
+function adminOnly(req, res, next) {
+  if (!req.user || req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'Admin access required' });
+  }
+  next();
+}
+
 // ─── STATIC FILES ───
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ─── AUTH ROUTES ───
-app.post('/api/auth/signup', async (req, res) => {
+app.post('/api/auth/signup', signupLimiter, async (req, res) => {
   try {
     const { email, name, password, lang } = req.body;
     if (!email || !name || !password) return res.status(400).json({ error: 'fillAll' });
@@ -66,7 +87,7 @@ app.post('/api/auth/signup', async (req, res) => {
   }
 });
 
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', loginLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'fillAll' });
