@@ -15,6 +15,28 @@ app.use((err, req, res, next) => {
   next(err);
 });
 
+// Simple cookie parser middleware
+app.use((req, res, next) => {
+  req.cookies = {};
+  const hdr = req.headers.cookie;
+  if (hdr) {
+    hdr.split(';').forEach(pair => {
+      const [k, ...v] = pair.trim().split('=');
+      if (k) req.cookies[k.trim()] = decodeURIComponent(v.join('='));
+    });
+  }
+  next();
+});
+
+// Cookie options for auth token
+const COOKIE_OPTS = {
+  httpOnly: true,
+  secure: true,
+  sameSite: 'Lax',
+  path: '/',
+  maxAge: 180 * 24 * 60 * 60 * 1000, // 180 days (matches JWT expiry)
+};
+
 const pool = process.env.DATABASE_URL
   ? new Pool({ connectionString: process.env.DATABASE_URL })
   : new Pool({
@@ -35,9 +57,12 @@ const signupLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 5, message: 'To
 
 // ─── AUTH MIDDLEWARE ───
 function auth(req, res, next) {
-  const hdr = req.headers.authorization;
-  if (!hdr) return res.status(401).json({ error: 'Not authenticated' });
-  const token = hdr.split(' ')[1];
+  // Prefer httpOnly cookie, fall back to Authorization header
+  let token = req.cookies && req.cookies.lumina_token;
+  if (!token) {
+    const hdr = req.headers.authorization;
+    if (hdr) token = hdr.split(' ')[1];
+  }
   if (!token) return res.status(401).json({ error: 'Not authenticated' });
   try {
     req.user = jwt.verify(token, JWT_SECRET);
@@ -74,8 +99,8 @@ app.post('/api/auth/signup', signupLimiter, async (req, res) => {
     );
     const u = result.rows[0];
     const token = jwt.sign({ id: u.id, email: u.email, role: u.role || 'user' }, JWT_SECRET, { expiresIn: '180d' });
+    res.cookie('lumina_token', token, COOKIE_OPTS);
     res.json({
-      token,
       user: { email: u.email, name: u.name, lang: u.lang, startDate: u.start_date }
     });
   } catch (e) {
@@ -97,14 +122,19 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
     if (!valid) return res.status(401).json({ error: 'wrongPw' });
 
     const token = jwt.sign({ id: u.id, email: u.email, role: u.role || 'user' }, JWT_SECRET, { expiresIn: '180d' });
+    res.cookie('lumina_token', token, COOKIE_OPTS);
     res.json({
-      token,
       user: { email: u.email, name: u.name, lang: u.lang, startDate: u.start_date }
     });
   } catch (e) {
     logger.error({ err: e }, 'Login error');
     res.status(500).json({ error: 'Server error' });
   }
+});
+
+app.post('/api/auth/logout', (req, res) => {
+  res.clearCookie('lumina_token', { httpOnly: true, secure: true, sameSite: 'Lax', path: '/' });
+  res.json({ ok: true });
 });
 
 app.get('/api/auth/session', auth, async (req, res) => {

@@ -6,13 +6,42 @@ import { createRoot } from "react-dom/client";
 // Web App version — PostgreSQL backend
 // ═══════════════════════════════════════════════════════
 
+// ─── ERROR BOUNDARY ───
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error: error };
+  }
+  componentDidCatch(error, info) {
+    console.error("Lumina error boundary caught:", error, info.componentStack);
+  }
+  render() {
+    if (this.state.hasError) {
+      return React.createElement("div", {
+        style: { display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+          minHeight: "100vh", fontFamily: "system-ui, sans-serif", background: "#faf8f5", color: "#333", padding: 24, textAlign: "center" }
+      },
+        React.createElement("h2", { style: { fontSize: 22, marginBottom: 12 } }, "Something went wrong"),
+        React.createElement("p", { style: { fontSize: 14, color: "#888", marginBottom: 20 } },
+          this.state.error ? this.state.error.message : "An unexpected error occurred."),
+        React.createElement("button", {
+          onClick: function() { window.location.reload(); },
+          style: { padding: "10px 28px", fontSize: 14, border: "none", borderRadius: 8, background: "#333", color: "#fff", cursor: "pointer" }
+        }, "Reload")
+      );
+    }
+    return this.props.children;
+  }
+}
+
 // ─── API HELPER ───
 var API_BASE = "/api";
 var api = {
-  token: (typeof localStorage !== "undefined") ? localStorage.getItem("lumina_token") : null,
   async req(method, path, body) {
-    var opts = { method: method, headers: {} };
-    if (this.token) opts.headers["Authorization"] = "Bearer " + this.token;
+    var opts = { method: method, headers: {}, credentials: "same-origin" };
     if (body) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
     var res = await fetch(API_BASE + path, opts);
     var data = await res.json();
@@ -21,23 +50,19 @@ var api = {
   },
   async signup(email, name, password, lang) {
     var data = await this.req("POST", "/auth/signup", { email: email, name: name, password: password, lang: lang });
-    this.token = data.token;
-    localStorage.setItem("lumina_token", data.token);
     return data.user;
   },
   async login(email, password) {
     var data = await this.req("POST", "/auth/login", { email: email, password: password });
-    this.token = data.token;
-    localStorage.setItem("lumina_token", data.token);
     return data.user;
   },
-  logout: function() {
-    this.token = null;
-    localStorage.removeItem("lumina_token");
+  logout: async function() {
+    try { await this.req("POST", "/auth/logout"); } catch(e) { /* ignore */ }
+    // Clear any legacy localStorage tokens
+    if (typeof localStorage !== "undefined") localStorage.removeItem("lumina_token");
   },
   async getSession() {
-    if (!this.token) return null;
-    try { return await this.req("GET", "/auth/session"); } catch(e) { this.logout(); return null; }
+    try { return await this.req("GET", "/auth/session"); } catch(e) { return null; }
   },
   async updateLang(lang) { return this.req("PUT", "/user/lang", { lang: lang }); },
   async getProgress() { return this.req("GET", "/progress"); },
@@ -1486,7 +1511,7 @@ function LuminaApp() {
     try { var p = await api.getProgress(); setProgress(p || {}); } catch(e) { setProgress({}); }
   };
   var handleLogout = async function() {
-    api.logout();
+    await api.logout();
     setUser(null); setProgress({}); setView("journey"); setSelDay(null);
   };
   var handleComplete = async function(dayNum) {
@@ -1584,4 +1609,4 @@ function LuminaApp() {
 
 // ─── MOUNT ───
 var root = createRoot(document.getElementById("root"));
-root.render(React.createElement(LuminaApp));
+root.render(React.createElement(ErrorBoundary, null, React.createElement(LuminaApp)));

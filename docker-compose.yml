@@ -39,7 +39,7 @@ services:
       DB_NAME: ${DB_NAME:-lumina}
       DB_USER: ${DB_USER:-lumina}
       DB_PASS: ${DB_PASS:-lumina_change_me}
-      JWT_SECRET: ${JWT_SECRET:-change-this-to-random-string}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set in .env}
       PORT: 3456
     depends_on:
       db:
