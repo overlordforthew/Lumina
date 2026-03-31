@@ -47,6 +47,8 @@ services:
 
 volumes:
   lumina_pgdata:
+    external: true
+    name: okw0cwwgskcow8k8o08gsok0_lumina-pgdata
 
 networks:
   coolify:
