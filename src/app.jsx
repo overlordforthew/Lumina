@@ -10,16 +10,22 @@ import { createRoot } from "react-dom/client";
 class ErrorBoundary extends React.Component {
   constructor(props) {
     super(props);
-    this.state = { hasError: false, error: null };
+    this.state = { hasError: false, error: null, errorInfo: null };
+    this.handleReset = this.handleReset.bind(this);
   }
   static getDerivedStateFromError(error) {
     return { hasError: true, error: error };
   }
   componentDidCatch(error, info) {
+    this.setState({ errorInfo: info });
     console.error("Lumina error boundary caught:", error, info.componentStack);
+  }
+  handleReset() {
+    this.setState({ hasError: false, error: null, errorInfo: null });
   }
   render() {
     if (this.state.hasError) {
+      var self = this;
       return React.createElement("div", {
         style: { display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
           minHeight: "100vh", fontFamily: "system-ui, sans-serif", background: "#faf8f5", color: "#333", padding: 24, textAlign: "center" }
@@ -27,10 +33,16 @@ class ErrorBoundary extends React.Component {
         React.createElement("h2", { style: { fontSize: 22, marginBottom: 12 } }, "Something went wrong"),
         React.createElement("p", { style: { fontSize: 14, color: "#888", marginBottom: 20 } },
           this.state.error ? this.state.error.message : "An unexpected error occurred."),
-        React.createElement("button", {
-          onClick: function() { window.location.reload(); },
-          style: { padding: "10px 28px", fontSize: 14, border: "none", borderRadius: 8, background: "#333", color: "#fff", cursor: "pointer" }
-        }, "Reload")
+        React.createElement("div", { style: { display: "flex", gap: 12 } },
+          React.createElement("button", {
+            onClick: function() { self.handleReset(); },
+            style: { padding: "10px 28px", fontSize: 14, border: "2px solid #333", borderRadius: 8, background: "#fff", color: "#333", cursor: "pointer" }
+          }, "Try Again"),
+          React.createElement("button", {
+            onClick: function() { window.location.reload(); },
+            style: { padding: "10px 28px", fontSize: 14, border: "none", borderRadius: 8, background: "#333", color: "#fff", cursor: "pointer" }
+          }, "Reload Page")
+        )
       );
     }
     return this.props.children;
@@ -39,14 +51,47 @@ class ErrorBoundary extends React.Component {
 
 // ─── API HELPER ───
 var API_BASE = "/api";
+var _sessionExpiredHandler = null;
 var api = {
-  async req(method, path, body) {
-    var opts = { method: method, headers: {}, credentials: "same-origin" };
-    if (body) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
-    var res = await fetch(API_BASE + path, opts);
-    var data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Request failed");
-    return data;
+  onSessionExpired: function(handler) { _sessionExpiredHandler = handler; },
+  async req(method, path, body, opts2) {
+    var retries = (opts2 && opts2.retries) || 0;
+    var attempt = 0;
+    while (true) {
+      var opts = { method: method, headers: {}, credentials: "same-origin" };
+      if (body) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
+      var res;
+      try {
+        res = await fetch(API_BASE + path, opts);
+      } catch (e) {
+        if (attempt < retries) { attempt++; await new Promise(function(r) { setTimeout(r, 1000 * attempt); }); continue; }
+        throw new Error("Network error. Please check your connection.");
+      }
+      // Handle 401 globally -- session expired or invalid token
+      if (res.status === 401 && path !== "/auth/login" && path !== "/auth/signup" && path !== "/auth/session") {
+        if (_sessionExpiredHandler) _sessionExpiredHandler();
+        throw new Error("Session expired. Please sign in again.");
+      }
+      // Handle rate limiting with Retry-After
+      if (res.status === 429) {
+        var retryAfter = res.headers.get("Retry-After");
+        throw new Error("Too many requests. Please wait " + (retryAfter || "a moment") + " and try again.");
+      }
+      // Retry on 5xx server errors
+      if (res.status >= 500 && attempt < retries) {
+        attempt++;
+        await new Promise(function(r) { setTimeout(r, 1000 * attempt); });
+        continue;
+      }
+      var data;
+      try {
+        data = await res.json();
+      } catch (e) {
+        throw new Error(res.status >= 500 ? "Server is temporarily unavailable." : "Unexpected response from server.");
+      }
+      if (!res.ok) throw new Error(data.error || "Request failed");
+      return data;
+    }
   },
   async signup(email, name, password, lang) {
     var data = await this.req("POST", "/auth/signup", { email: email, name: name, password: password, lang: lang });
@@ -62,17 +107,23 @@ var api = {
     if (typeof localStorage !== "undefined") localStorage.removeItem("lumina_token");
   },
   async getSession() {
-    try { return await this.req("GET", "/auth/session"); } catch(e) { return null; }
+    try { return await this.req("GET", "/auth/session", null, { retries: 1 }); } catch(e) { return null; }
   },
   async updateLang(lang) { return this.req("PUT", "/user/lang", { lang: lang }); },
-  async getProgress() { return this.req("GET", "/progress"); },
+  async getProgress() { return this.req("GET", "/progress", null, { retries: 2 }); },
   async completeDay(dayNum) { return this.req("POST", "/progress/" + dayNum); },
   async getAudio(dayNum) {
-    try { var d = await this.req("GET", "/audio/" + dayNum); return d.data; } catch(e) { return null; }
+    try { var d = await this.req("GET", "/audio/" + dayNum, null, { retries: 1 }); return d.data; } catch(e) { return null; }
   },
-  async saveAudio(dayNum, data) { return this.req("POST", "/audio/" + dayNum, { data: data }); },
+  async saveAudio(dayNum, data) {
+    // Validate file size before sending (10MB limit)
+    if (data && data.length > 10 * 1024 * 1024) {
+      throw new Error("Audio file too large. Maximum size is 10MB.");
+    }
+    return this.req("POST", "/audio/" + dayNum, { data: data });
+  },
   async getImage(dayNum) {
-    try { var d = await this.req("GET", "/image/" + dayNum); return d.data; } catch(e) { return null; }
+    try { var d = await this.req("GET", "/image/" + dayNum, null, { retries: 1 }); return d.data; } catch(e) { return null; }
   },
 };
 
@@ -1251,20 +1302,26 @@ function LessonImage(props) {
   var cat = props.cat;
   var [imgData, setImgData] = useState(null);
   var [loadingImg, setLoadingImg] = useState(true);
+  var [imgError, setImgError] = useState(false);
   useEffect(function() {
     setLoadingImg(true);
     setImgData(null);
+    setImgError(false);
+    var cancelled = false;
     var load = async function() {
       try {
         var data = await api.getImage(dayNum);
-        if (data) setImgData(data);
-      } catch(e) {}
-      setLoadingImg(false);
+        if (!cancelled && data) setImgData(data);
+      } catch(e) {
+        // Silently fall back to watercolor art
+      }
+      if (!cancelled) setLoadingImg(false);
     };
     load();
+    return function() { cancelled = true; };
   }, [dayNum]);
   if (loadingImg) return <div style={{ height: 160, borderRadius: 14, background: cat.bg, display: "flex", alignItems: "center", justifyContent: "center" }}><p style={{ fontFamily: B, fontSize: 12, color: "#a09488" }}>Loading...</p></div>;
-  if (imgData) return <img src={imgData} alt={"Day " + dayNum} style={{ width: "100%", borderRadius: 14, display: "block", objectFit: "cover", maxHeight: 220 }} />;
+  if (imgData && !imgError) return <img src={imgData} alt={"Day " + dayNum} onError={function() { setImgError(true); }} style={{ width: "100%", borderRadius: 14, display: "block", objectFit: "cover", maxHeight: 220 }} />;
   return <WatercolorArt dayNum={dayNum} cat={cat} />;
 }
 
@@ -1276,28 +1333,52 @@ function LessonView(props) {
   var [playing, setPlaying] = useState(false);
   var [showCooldown, setShowCooldown] = useState(false);
   var [audioUrl, setAudioUrl] = useState(null);
+  var [audioError, setAudioError] = useState(null);
+  var [uploadError, setUploadError] = useState(null);
   var audioRef = useRef(null);
 
   // Load stored mp3 for this day
   useEffect(function() {
     setAudioUrl(null);
+    setAudioError(null);
+    setUploadError(null);
+    var cancelled = false;
     var loadAudio = async function() {
       try {
         var data = await api.getAudio(dayNum);
-        if (data) setAudioUrl(data);
-      } catch(e) {}
+        if (!cancelled && data) setAudioUrl(data);
+      } catch(e) {
+        // Silently fall back to placeholder audio
+      }
     };
     loadAudio();
+    // Cleanup audio on unmount or day change
+    return function() {
+      cancelled = true;
+      if (audioRef.current) { audioRef.current.pause(); audioRef.current = null; }
+      setPlaying(false);
+    };
   }, [dayNum]);
 
   var handlePlay = function() {
+    setAudioError(null);
     if (audioUrl) {
       // Play stored mp3
       if (audioRef.current) { audioRef.current.pause(); }
-      var audio = new Audio(audioUrl);
+      var audio;
+      try {
+        audio = new Audio(audioUrl);
+      } catch(e) {
+        setAudioError("Could not load audio.");
+        return;
+      }
       audioRef.current = audio;
       setPlaying(true);
-      audio.play().catch(function() {});
+      audio.play().catch(function(err) {
+        setAudioError("Audio playback failed. Try again.");
+        setPlaying(false);
+      });
+      audio.onerror = function() { setAudioError("Audio file could not be played."); setPlaying(false); };
       audio.onended = function() { setPlaying(false); };
     } else {
       // Fallback bell sound
@@ -1311,14 +1392,39 @@ function LessonView(props) {
     setPlaying(false);
   };
 
+  var MAX_AUDIO_SIZE = 10 * 1024 * 1024; // 10MB
+  var ALLOWED_AUDIO_TYPES = ["audio/mpeg", "audio/mp3", "audio/wav", "audio/ogg", "audio/m4a", "audio/x-m4a", "audio/mp4"];
   var handleUploadAudio = function(e) {
     var file = e.target.files && e.target.files[0];
     if (!file) return;
+    setUploadError(null);
+    setAudioError(null);
+    // Validate file size
+    if (file.size > MAX_AUDIO_SIZE) {
+      setUploadError("File too large. Maximum size is 10MB.");
+      e.target.value = "";
+      return;
+    }
+    // Validate file type
+    if (file.type && ALLOWED_AUDIO_TYPES.indexOf(file.type) < 0 && !file.type.startsWith("audio/")) {
+      setUploadError("Invalid file type. Please upload an audio file.");
+      e.target.value = "";
+      return;
+    }
     var reader = new FileReader();
     reader.onload = async function(ev) {
       var data = ev.target.result;
       setAudioUrl(data);
-      try { await api.saveAudio(dayNum, data); } catch(err) {}
+      try {
+        await api.saveAudio(dayNum, data);
+        setUploadError(null);
+      } catch(err) {
+        setUploadError("Failed to save: " + err.message);
+        // Keep local preview so user can retry
+      }
+    };
+    reader.onerror = function() {
+      setUploadError("Failed to read audio file. Please try again.");
     };
     reader.readAsDataURL(file);
   };
@@ -1352,12 +1458,20 @@ function LessonView(props) {
             </div>
           </div>
         </div>
+        {/* Audio error display */}
+        {audioError && (
+          <p style={{ fontFamily: B, fontSize: 11, color: "#c0524a", marginTop: 8 }}>{audioError}</p>
+        )}
         {/* MP3 upload */}
         <label style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 10, cursor: "pointer", padding: "6px 0" }}>
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#a09488" strokeWidth="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
           <span style={{ fontFamily: B, fontSize: 11, color: "#a09488" }}>{audioUrl ? t(user, "replaceMp3") : t(user, "uploadMp3")}</span>
           <input type="file" accept="audio/mp3,audio/mpeg,audio/*" onChange={handleUploadAudio} style={{ display: "none" }} />
         </label>
+        {/* Upload error display */}
+        {uploadError && (
+          <p style={{ fontFamily: B, fontSize: 11, color: "#c0524a", marginTop: 4 }}>{uploadError}</p>
+        )}
       </div>
 
       {/* Lesson text */}
@@ -1491,8 +1605,27 @@ function LuminaApp() {
   var [view, setView] = useState("journey");
   var [selDay, setSelDay] = useState(null);
   var [loading, setLoading] = useState(true);
+  var [appError, setAppError] = useState(null);
   // Test mode only activates via ?test in URL - invisible to regular users
   var testMode = typeof window !== "undefined" && window.location.search.indexOf("test") >= 0;
+
+  // Register global session expiry handler to force re-login
+  useEffect(function() {
+    api.onSessionExpired(function() {
+      setUser(null);
+      setProgress({});
+      setView("journey");
+      setSelDay(null);
+    });
+  }, []);
+
+  // Auto-dismiss error toast after 5 seconds
+  useEffect(function() {
+    if (!appError) return;
+    var timer = setTimeout(function() { setAppError(null); }, 5000);
+    return function() { clearTimeout(timer); };
+  }, [appError]);
+
   useEffect(function() {
     var init = async function() {
       try {
@@ -1501,30 +1634,50 @@ function LuminaApp() {
           setUser(u);
           try { var p = await api.getProgress(); setProgress(p || {}); } catch(e) { setProgress({}); }
         }
-      } catch(e) {}
+      } catch(e) {
+        // Session check failed -- user will see login screen
+      }
       setLoading(false);
     };
     init();
   }, []);
   var handleLogin = async function(ud) {
     setUser(ud);
+    setAppError(null);
     try { var p = await api.getProgress(); setProgress(p || {}); } catch(e) { setProgress({}); }
   };
   var handleLogout = async function() {
-    await api.logout();
-    setUser(null); setProgress({}); setView("journey"); setSelDay(null);
+    try { await api.logout(); } catch(e) { /* proceed with local cleanup even if server call fails */ }
+    setUser(null); setProgress({}); setView("journey"); setSelDay(null); setAppError(null);
   };
   var handleComplete = async function(dayNum) {
+    setAppError(null);
+    var prevProgress = progress;
     var np = Object.assign({}, progress);
     np[dayNum] = { completedAt: new Date().toISOString() };
     setProgress(np);
-    try { await api.completeDay(dayNum); } catch(e) {}
+    try {
+      await api.completeDay(dayNum);
+    } catch(e) {
+      // Rollback optimistic update on failure
+      setProgress(prevProgress);
+      setAppError(e.message || "Failed to save progress. Please try again.");
+      return;
+    }
     setView("journey"); setSelDay(null);
   };
   var handleUpdateLang = async function(newLang) {
+    setAppError(null);
+    var prevUser = user;
     var updated = Object.assign({}, user, { lang: newLang });
     setUser(updated);
-    try { await api.updateLang(newLang); } catch(e) {}
+    try {
+      await api.updateLang(newLang);
+    } catch(e) {
+      // Rollback optimistic update on failure
+      setUser(prevUser);
+      setAppError(e.message || "Failed to update language. Please try again.");
+    }
   };
   if (loading) return <div style={{ height: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: "#f5f0e8" }}><style>{CSS}</style><Logo size={60} /></div>;
   if (!user) return <AuthScreen onLogin={handleLogin} />;
@@ -1584,13 +1737,19 @@ function LuminaApp() {
   else if (view === "lesson") content = <LessonView user={user} dayData={getDayData(lessonDay, user)} dayNum={lessonDay} isCompleted={!!progress[lessonDay]} onComplete={handleComplete} cooldownMsg={cooldownMsg} />;
   else content = <ProfileView user={user} progress={progress} onLogout={handleLogout} onUpdateLang={handleUpdateLang} />;
   return (
-    <div style={{ height: "100vh", maxWidth: 430, margin: "0 auto", background: "#f5f0e8", display: "flex", flexDirection: "column", fontFamily: B, overflow: "hidden" }}>
+    <div style={{ height: "100vh", maxWidth: 430, margin: "0 auto", background: "#f5f0e8", display: "flex", flexDirection: "column", fontFamily: B, overflow: "hidden", position: "relative" }}>
       <style>{CSS}</style>
       <div style={{ padding: "12px 20px 10px", display: "flex", alignItems: "center", justifyContent: "space-between", background: "#fff", borderBottom: "1px solid #e8e2d8", flexShrink: 0 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}><Logo size={30} /><span style={{ fontFamily: F, fontWeight: 400, fontSize: 17, color: "#3a3028", letterSpacing: 4 }}>LUMINA</span></div>
         <div style={{ fontFamily: B, fontSize: 11, fontWeight: 600, color: "#8a7e6e", background: "#f5f0e8", padding: "4px 12px", borderRadius: 16 }}>{tf(user, "dayOf")(activeDay, 90)}</div>
       </div>
       {content}
+      {/* Error toast */}
+      {appError && (
+        <div onClick={function() { setAppError(null); }} style={{ position: "absolute", top: 60, left: "50%", transform: "translateX(-50%)", background: "#c0524a", color: "#fff", fontFamily: B, fontSize: 13, padding: "10px 20px", borderRadius: 12, boxShadow: "0 4px 16px rgba(0,0,0,0.15)", cursor: "pointer", zIndex: 100, maxWidth: "90%", textAlign: "center", animation: "fadeIn 0.3s ease" }}>
+          {appError}
+        </div>
+      )}
       <div style={{ display: "flex", background: "#fff", borderTop: "1px solid #e8e2d8", padding: "4px 0 8px", flexShrink: 0 }}>
         {["journey","lesson","profile"].map(function(id) {
           var labels = { journey: t(user, "journey"), lesson: t(user, "lesson"), profile: t(user, "profile") };

@@ -21,8 +21,12 @@ app.use((req, res, next) => {
   const hdr = req.headers.cookie;
   if (hdr) {
     hdr.split(';').forEach(pair => {
-      const [k, ...v] = pair.trim().split('=');
-      if (k) req.cookies[k.trim()] = decodeURIComponent(v.join('='));
+      try {
+        const [k, ...v] = pair.trim().split('=');
+        if (k) req.cookies[k.trim()] = decodeURIComponent(v.join('='));
+      } catch (e) {
+        // Skip malformed cookie values that fail decodeURIComponent
+      }
     });
   }
   next();
@@ -47,6 +51,11 @@ const pool = process.env.DATABASE_URL
       password: process.env.DB_PASS,
     });
 
+// Handle unexpected pool errors to prevent process crash
+pool.on('error', (err) => {
+  logger.error({ err }, 'Unexpected database pool error');
+});
+
 // No fallback — validateEnv() guarantees JWT_SECRET exists
 const JWT_SECRET = process.env.JWT_SECRET;
 const PORT = process.env.PORT || 3456;
@@ -68,6 +77,10 @@ function auth(req, res, next) {
     req.user = jwt.verify(token, JWT_SECRET);
     next();
   } catch (e) {
+    if (e.name === 'TokenExpiredError') {
+      res.clearCookie('lumina_token', { httpOnly: true, secure: true, sameSite: 'Lax', path: '/' });
+      return res.status(401).json({ error: 'Token expired' });
+    }
     res.status(401).json({ error: 'Invalid token' });
   }
 }
@@ -83,11 +96,29 @@ function adminOnly(req, res, next) {
 // ─── STATIC FILES ───
 app.use(express.static(path.join(__dirname, 'public')));
 
+// ─── INPUT VALIDATORS ───
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const MAX_NAME_LEN = 100;
+const MAX_EMAIL_LEN = 255;
+const MAX_PASSWORD_LEN = 128;
+const VALID_LANGS = ['en', 'ja'];
+// 10 MB limit for base64-encoded audio/image data
+const MAX_DATA_PAYLOAD = 10 * 1024 * 1024;
+
 // ─── AUTH ROUTES ───
 app.post('/api/auth/signup', signupLimiter, async (req, res) => {
   try {
     const { email, name, password, lang } = req.body;
     if (!email || !name || !password) return res.status(400).json({ error: 'fillAll' });
+    if (typeof email !== 'string' || typeof name !== 'string' || typeof password !== 'string') {
+      return res.status(400).json({ error: 'Invalid input types' });
+    }
+    if (!EMAIL_RE.test(email)) return res.status(400).json({ error: 'Invalid email format' });
+    if (email.length > MAX_EMAIL_LEN) return res.status(400).json({ error: 'Email too long' });
+    if (name.length > MAX_NAME_LEN) return res.status(400).json({ error: 'Name too long' });
+    if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    if (password.length > MAX_PASSWORD_LEN) return res.status(400).json({ error: 'Password too long' });
+    if (lang && !VALID_LANGS.includes(lang)) return res.status(400).json({ error: 'Invalid language' });
 
     const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email.toLowerCase()]);
     if (existing.rows.length > 0) return res.status(409).json({ error: 'exists' });
@@ -113,6 +144,10 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'fillAll' });
+    if (typeof email !== 'string' || typeof password !== 'string') {
+      return res.status(400).json({ error: 'Invalid input types' });
+    }
+    if (!EMAIL_RE.test(email)) return res.status(400).json({ error: 'Invalid email format' });
 
     const result = await pool.query('SELECT * FROM users WHERE email = $1', [email.toLowerCase()]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'noAccount' });
@@ -140,7 +175,11 @@ app.post('/api/auth/logout', (req, res) => {
 app.get('/api/auth/session', auth, async (req, res) => {
   try {
     const result = await pool.query('SELECT id, email, name, lang, start_date FROM users WHERE id = $1', [req.user.id]);
-    if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    if (result.rows.length === 0) {
+      // User was deleted but token is still valid -- clear the stale cookie
+      res.clearCookie('lumina_token', { httpOnly: true, secure: true, sameSite: 'Lax', path: '/' });
+      return res.status(401).json({ error: 'Account no longer exists' });
+    }
     const u = result.rows[0];
     res.json({ email: u.email, name: u.name, lang: u.lang, startDate: u.start_date });
   } catch (e) {
@@ -153,6 +192,9 @@ app.get('/api/auth/session', auth, async (req, res) => {
 app.put('/api/user/lang', auth, async (req, res) => {
   try {
     const { lang } = req.body;
+    if (!lang || !VALID_LANGS.includes(lang)) {
+      return res.status(400).json({ error: 'Invalid language. Supported: ' + VALID_LANGS.join(', ') });
+    }
     await pool.query('UPDATE users SET lang = $1 WHERE id = $2', [lang, req.user.id]);
     res.json({ ok: true, lang });
   } catch (e) {
@@ -220,6 +262,9 @@ app.post('/api/audio/:day', auth, async (req, res) => {
     if (isNaN(dayNum) || dayNum < 1 || dayNum > 90) return res.status(400).json({ error: 'Invalid day' });
     const { data } = req.body;
     if (!data) return res.status(400).json({ error: 'No audio data' });
+    if (typeof data !== 'string') return res.status(400).json({ error: 'Invalid audio data format' });
+    if (data.length > MAX_DATA_PAYLOAD) return res.status(413).json({ error: 'Audio file too large (max 10MB)' });
+    if (!data.startsWith('data:audio/')) return res.status(400).json({ error: 'Invalid audio format. Must be an audio file.' });
     await pool.query(
       'INSERT INTO audio (user_id, day_num, audio_data) VALUES ($1, $2, $3) ON CONFLICT (user_id, day_num) DO UPDATE SET audio_data = $3',
       [req.user.id, dayNum, data]
@@ -240,6 +285,7 @@ app.get('/api/image/:day', async (req, res) => {
     if (result.rows.length === 0) return res.status(404).json({ error: 'No image' });
     res.json({ data: result.rows[0].image_data });
   } catch (e) {
+    logger.error({ err: e }, 'Get image error');
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -250,6 +296,9 @@ app.post('/api/image/:day', auth, adminOnly, async (req, res) => {
     if (isNaN(dayNum) || dayNum < 1 || dayNum > 90) return res.status(400).json({ error: 'Invalid day' });
     const { data } = req.body;
     if (!data) return res.status(400).json({ error: 'No image data' });
+    if (typeof data !== 'string') return res.status(400).json({ error: 'Invalid image data format' });
+    if (data.length > MAX_DATA_PAYLOAD) return res.status(413).json({ error: 'Image file too large (max 10MB)' });
+    if (!data.startsWith('data:image/')) return res.status(400).json({ error: 'Invalid image format. Must be an image file.' });
     await pool.query(
       'INSERT INTO images (day_num, image_data) VALUES ($1, $2) ON CONFLICT (day_num) DO UPDATE SET image_data = $2',
       [dayNum, data]
@@ -264,6 +313,14 @@ app.post('/api/image/:day', auth, adminOnly, async (req, res) => {
 // ─── SPA FALLBACK ───
 app.get('/*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// ─── GLOBAL ERROR HANDLER ───
+app.use((err, req, res, _next) => {
+  logger.error({ err, method: req.method, url: req.url }, 'Unhandled route error');
+  if (!res.headersSent) {
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
 // ─── START ───
@@ -328,6 +385,7 @@ async function initDB() {
     }
   } catch (e) {
     logger.error({ err: e }, 'DB init error');
+    throw e;
   }
 }
 
@@ -338,8 +396,46 @@ if (require.main === module) {
   // Validate required environment variables before starting
   validateEnv();
   initDB().then(() => {
-    app.listen(PORT, '0.0.0.0', () => {
+    const server = app.listen(PORT, '0.0.0.0', () => {
       logger.info({ port: PORT }, 'LUMINA server running');
     });
+    server.on('error', (err) => {
+      logger.fatal({ err }, 'Server failed to start');
+      process.exit(1);
+    });
+
+    // ─── GRACEFUL SHUTDOWN ───
+    const shutdown = async (signal) => {
+      logger.info({ signal }, 'Shutdown signal received, closing gracefully...');
+      server.close(() => {
+        logger.info('HTTP server closed');
+        pool.end().then(() => {
+          logger.info('Database pool closed');
+          process.exit(0);
+        }).catch((err) => {
+          logger.error({ err }, 'Error closing database pool');
+          process.exit(1);
+        });
+      });
+      // Force exit after 10 seconds if graceful shutdown hangs
+      setTimeout(() => {
+        logger.error('Graceful shutdown timed out, forcing exit');
+        process.exit(1);
+      }, 10000).unref();
+    };
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('SIGINT', () => shutdown('SIGINT'));
+  }).catch((err) => {
+    logger.fatal({ err }, 'Database initialization failed, aborting startup');
+    process.exit(1);
+  });
+
+  // Catch unhandled rejections and uncaught exceptions
+  process.on('unhandledRejection', (reason, promise) => {
+    logger.error({ reason }, 'Unhandled promise rejection');
+  });
+  process.on('uncaughtException', (err) => {
+    logger.fatal({ err }, 'Uncaught exception, shutting down');
+    process.exit(1);
   });
 }
