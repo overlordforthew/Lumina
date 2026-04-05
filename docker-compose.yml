@@ -6,7 +6,7 @@ services:
     environment:
       POSTGRES_DB: ${DB_NAME:-lumina}
       POSTGRES_USER: ${DB_USER:-lumina}
-      POSTGRES_PASSWORD: ${DB_PASS:-lumina_change_me}
+      POSTGRES_PASSWORD: ${DB_PASS:?DB_PASS must be set in .env}
     volumes:
       - lumina_pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -38,8 +38,9 @@ services:
       DB_PORT: 5432
       DB_NAME: ${DB_NAME:-lumina}
       DB_USER: ${DB_USER:-lumina}
-      DB_PASS: ${DB_PASS:-lumina_change_me}
+      DB_PASS: ${DB_PASS:?DB_PASS must be set in .env}
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set in .env}
+      NODE_ENV: production
       PORT: 3456
     depends_on:
       db:
