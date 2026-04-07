@@ -3,6 +3,15 @@ services:
   db:
     image: postgres:17-alpine
     restart: unless-stopped
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        trap 'kill $$PG_PID; wait $$PG_PID' TERM INT
+        docker-entrypoint.sh postgres &
+        PG_PID=$$!
+        until pg_isready -U "$$POSTGRES_USER" 2>/dev/null; do sleep 1; done
+        psql -U "$$POSTGRES_USER" -c "ALTER USER \"$$POSTGRES_USER\" WITH PASSWORD '$$POSTGRES_PASSWORD';" 2>/dev/null || true
+        wait $$PG_PID
     environment:
       POSTGRES_DB: ${DB_NAME:-lumina}
       POSTGRES_USER: ${DB_USER:-lumina}
