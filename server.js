@@ -96,6 +96,16 @@ function adminOnly(req, res, next) {
 // ─── STATIC FILES ───
 app.use(express.static(path.join(__dirname, 'public')));
 
+// ─── DIAGNOSTIC HEALTH CHECK (temporary) ───
+app.get('/api/db-health', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT NOW() as time, current_database() as db');
+    res.json({ ok: true, db: result.rows[0].db, time: result.rows[0].time });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message, code: e.code });
+  }
+});
+
 // ─── INPUT VALIDATORS ───
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MAX_NAME_LEN = 100;
