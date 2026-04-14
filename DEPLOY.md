@@ -1,20 +1,28 @@
-# LUMINA — Docker Deployment Guide
-## Hetzner CX33 alongside Beast Mode
+# Lumina Deployment
 
-LUMINA runs in its own Docker container with its own PostgreSQL container.
-Nginx on the host proxies /lumina to the LUMINA container.
+Lumina no longer runs its own PostgreSQL container.
 
----
+Current model:
+- Nami billing and entitlements live in the `namibarden` database
+- Lumina app data lives in the `lumina` schema inside that same database
+- The Lumina app container joins the shared `namibarden-internal` Docker network and connects to `namibarden-db`
 
-## Step-by-step
+## Deploy order
 
-### 1. Upload to server
-### 2. Edit passwords
-### 3. Docker compose up
-### 4. Add nginx block
-### 5. Done
+1. Apply Nami DB migrations:
+   - `migration-lumina-billing.sql`
+   - `migration-lumina-app-schema.sql`
+2. Recreate Nami so the fixed Docker network name is in place.
+3. Deploy Lumina with:
+   - `DB_HOST=namibarden-db`
+   - `DB_NAME=namibarden`
+   - `DB_USER=namibarden`
+   - `DB_PASSWORD=<same password as Nami DB>`
+   - `DB_SCHEMA=lumina`
+   - `NAMI_LUMINA_BRIDGE_SECRET=<shared bridge secret>`
+4. Rebuild Lumina: `docker compose up --build -d`
 
-See the chat for full walkthrough with every keystroke.
+## Notes
 
-# Auto-deploy test
-
+- `LUMINA_ENABLE_TEST_USER` should stay `0` in production.
+- Lumina still has its own app container; only the database layer is shared now.

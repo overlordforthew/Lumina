@@ -8,125 +8,152 @@ import { createRoot } from "react-dom/client";
 
 // ─── ERROR BOUNDARY ───
 class ErrorBoundary extends React.Component {
-  constructor(props) {
-    super(props);
-    this.state = { hasError: false, error: null, errorInfo: null };
-    this.handleReset = this.handleReset.bind(this);
-  }
-  static getDerivedStateFromError(error) {
-    return { hasError: true, error: error };
-  }
-  componentDidCatch(error, info) {
-    this.setState({ errorInfo: info });
-    console.error("Lumina error boundary caught:", error, info.componentStack);
-  }
-  handleReset() {
-    this.setState({ hasError: false, error: null, errorInfo: null });
-  }
-  render() {
-    if (this.state.hasError) {
-      var self = this;
-      return React.createElement("div", {
-        style: { display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
-          minHeight: "100vh", fontFamily: "system-ui, sans-serif", background: "#faf8f5", color: "#333", padding: 24, textAlign: "center" }
-      },
-        React.createElement("h2", { style: { fontSize: 22, marginBottom: 12 } }, "Something went wrong"),
-        React.createElement("p", { style: { fontSize: 14, color: "#888", marginBottom: 20 } },
-          this.state.error ? this.state.error.message : "An unexpected error occurred."),
-        React.createElement("div", { style: { display: "flex", gap: 12 } },
-          React.createElement("button", {
-            onClick: function() { self.handleReset(); },
-            style: { padding: "10px 28px", fontSize: 14, border: "2px solid #333", borderRadius: 8, background: "#fff", color: "#333", cursor: "pointer" }
-          }, "Try Again"),
-          React.createElement("button", {
-            onClick: function() { window.location.reload(); },
-            style: { padding: "10px 28px", fontSize: 14, border: "none", borderRadius: 8, background: "#333", color: "#fff", cursor: "pointer" }
-          }, "Reload Page")
-        )
-      );
-    }
-    return this.props.children;
-  }
+  constructor(props) { super(props); this.state = { hasError: false }; }
+  static getDerivedStateFromError() { return { hasError: true }; }
+  componentDidCatch(error, info) { console.error('[lumina] React error:', error, info); }
+  render() { return this.state.hasError ? React.createElement('div', {style:{padding:'2rem',textAlign:'center'}}, 'Something went wrong. Please refresh the page.') : this.props.children; }
 }
 
 // ─── API HELPER ───
 var API_BASE = "/api";
-var _sessionExpiredHandler = null;
 var api = {
-  onSessionExpired: function(handler) { _sessionExpiredHandler = handler; },
-  async req(method, path, body, opts2) {
-    var retries = (opts2 && opts2.retries) || 0;
-    var attempt = 0;
-    while (true) {
-      var opts = { method: method, headers: {}, credentials: "same-origin" };
-      if (body) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
-      var res;
-      try {
-        res = await fetch(API_BASE + path, opts);
-      } catch (e) {
-        if (attempt < retries) { attempt++; await new Promise(function(r) { setTimeout(r, 1000 * attempt); }); continue; }
-        throw new Error("Network error. Please check your connection.");
-      }
-      // Handle 401 globally -- session expired or invalid token
-      if (res.status === 401 && path !== "/auth/login" && path !== "/auth/signup" && path !== "/auth/session") {
-        if (_sessionExpiredHandler) _sessionExpiredHandler();
-        throw new Error("Session expired. Please sign in again.");
-      }
-      // Handle rate limiting with Retry-After
-      if (res.status === 429) {
-        var retryAfter = res.headers.get("Retry-After");
-        throw new Error("Too many requests. Please wait " + (retryAfter || "a moment") + " and try again.");
-      }
-      // Retry on 5xx server errors
-      if (res.status >= 500 && attempt < retries) {
-        attempt++;
-        await new Promise(function(r) { setTimeout(r, 1000 * attempt); });
-        continue;
-      }
-      var data;
-      try {
-        data = await res.json();
-      } catch (e) {
-        throw new Error(res.status >= 500 ? "Server is temporarily unavailable." : "Unexpected response from server.");
-      }
-      if (!res.ok) throw new Error(data.error || "Request failed");
-      return data;
+  token: (typeof localStorage !== "undefined") ? localStorage.getItem("lumina_token") : null,
+  setToken: function(token) {
+    this.token = token || null;
+    if (typeof localStorage === "undefined") return;
+    if (token) localStorage.setItem("lumina_token", token);
+    else localStorage.removeItem("lumina_token");
+  },
+  async req(method, path, body) {
+    var controller = new AbortController();
+    var timeout = setTimeout(function() { controller.abort(); }, 15000);
+    var opts = { method: method, headers: {}, credentials: "include", signal: controller.signal };
+    if (this.token) opts.headers["Authorization"] = "Bearer " + this.token;
+    if (body) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
+    var res;
+    try {
+      res = await fetch(API_BASE + path, opts);
+    } catch(e) {
+      clearTimeout(timeout);
+      if (e.name === "AbortError") throw new Error("Request timed out");
+      throw e;
     }
+    clearTimeout(timeout);
+    var text = await res.text();
+    var data = {};
+    if (text) {
+      try { data = JSON.parse(text); } catch(e) { data = { error: text }; }
+    }
+    if (!res.ok) throw new Error(data.error || "Request failed");
+    return data;
   },
   async signup(email, name, password, lang) {
     var data = await this.req("POST", "/auth/signup", { email: email, name: name, password: password, lang: lang });
+    this.setToken(data.token);
     return data.user;
   },
   async login(email, password) {
     var data = await this.req("POST", "/auth/login", { email: email, password: password });
+    this.setToken(data.token);
     return data.user;
   },
-  logout: async function() {
-    try { await this.req("POST", "/auth/logout"); } catch(e) { /* ignore */ }
-    // Clear any legacy localStorage tokens
-    if (typeof localStorage !== "undefined") localStorage.removeItem("lumina_token");
+  async logout() {
+    try { await this.req("POST", "/auth/logout"); } catch(e) {}
+    this.setToken(null);
   },
   async getSession() {
-    try { return await this.req("GET", "/auth/session", null, { retries: 1 }); } catch(e) { return null; }
+    try { return await this.req("GET", "/auth/session"); } catch(e) { this.setToken(null); return null; }
   },
   async updateLang(lang) { return this.req("PUT", "/user/lang", { lang: lang }); },
-  async getProgress() { return this.req("GET", "/progress", null, { retries: 2 }); },
-  async completeDay(dayNum) { return this.req("POST", "/progress/" + dayNum); },
-  async getAudio(dayNum) {
-    try { var d = await this.req("GET", "/audio/" + dayNum, null, { retries: 1 }); return d.data; } catch(e) { return null; }
-  },
-  async saveAudio(dayNum, data) {
-    // Validate file size before sending (10MB limit)
-    if (data && data.length > 10 * 1024 * 1024) {
-      throw new Error("Audio file too large. Maximum size is 10MB.");
+  async getBillingStatus(refresh) { return this.req("GET", "/billing/status" + (refresh ? "?refresh=1" : "")); },
+  async createBillingPortal(returnUrl) { return this.req("POST", "/billing/portal", { return_url: returnUrl }); },
+  async exportAccountData() {
+    var opts = { method: "GET", headers: {}, credentials: "include" };
+    if (this.token) opts.headers.Authorization = "Bearer " + this.token;
+    var res = await fetch(API_BASE + "/account/export", opts);
+    if (!res.ok) {
+      var text = await res.text();
+      var data = {};
+      if (text) {
+        try { data = JSON.parse(text); } catch(e) { data = { error: text }; }
+      }
+      throw new Error(data.error || "Unable to export account data");
     }
-    return this.req("POST", "/audio/" + dayNum, { data: data });
+    var blob = await res.blob();
+    var disposition = res.headers.get("Content-Disposition") || "";
+    var match = disposition.match(/filename=\"?([^\";]+)\"?/i);
+    return {
+      blob: blob,
+      filename: match ? match[1] : "lumina-export.json"
+    };
   },
+  async deleteAccount(password, confirmText) {
+    return this.req("POST", "/account/delete", { password: password, confirm_text: confirmText });
+  },
+  async getProgress() { return this.req("GET", "/progress"); },
+  async completeDay(dayNum) { return this.req("POST", "/progress/" + dayNum); },
+  async getCheckins() { return this.req("GET", "/checkins"); },
+  async saveCheckin(dayNum, payload) { return this.req("PUT", "/checkins/" + dayNum, payload); },
+  async getReflections() { return this.req("GET", "/reflections"); },
+  async saveReflection(dayNum, payload) { return this.req("PUT", "/reflections/" + dayNum, payload); },
+  async getAudio(dayNum) {
+    try { var d = await this.req("GET", "/audio/" + dayNum); return d.data; } catch(e) { return null; }
+  },
+  async saveAudio(dayNum, data) { return this.req("POST", "/audio/" + dayNum, { data: data }); },
   async getImage(dayNum) {
-    try { var d = await this.req("GET", "/image/" + dayNum, null, { retries: 1 }); return d.data; } catch(e) { return null; }
+    try { var d = await this.req("GET", "/image/" + dayNum); return d.data; } catch(e) { return null; }
   },
 };
 
+var ANALYTICS_SESSION_KEY = "lumina_analytics_session";
+
+function getAnalyticsSessionId() {
+  if (typeof localStorage === "undefined") return "lumina-session";
+  var existing = localStorage.getItem(ANALYTICS_SESSION_KEY);
+  if (existing) return existing;
+  var next = (typeof crypto !== "undefined" && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : ("lumina-" + Date.now() + "-" + Math.random().toString(16).slice(2));
+  localStorage.setItem(ANALYTICS_SESSION_KEY, next);
+  return next;
+}
+
+function getAnalyticsPagePath() {
+  if (typeof window === "undefined") return "/";
+  return (window.location.pathname || "/") + (window.location.search || "");
+}
+
+function trackEvent(name, properties, options) {
+  try {
+    var payload = {
+      event: name,
+      properties: properties || {},
+      email: options && options.email ? options.email : null,
+      session_id: getAnalyticsSessionId(),
+      page_path: getAnalyticsPagePath(),
+      source: (options && options.source) || "app"
+    };
+    var headers = { "Content-Type": "application/json" };
+    if (api.token) headers.Authorization = "Bearer " + api.token;
+    fetch(API_BASE + "/analytics/track", {
+      method: "POST",
+      headers: headers,
+      credentials: "include",
+      keepalive: true,
+      body: JSON.stringify(payload)
+    }).catch(function() {});
+  } catch(e) {}
+}
+
+function hasLuminaAccess(billing) {
+  return !!(billing && billing.entitlement && billing.entitlement.hasAccess);
+}
+
+function wait(ms) {
+  return new Promise(function(resolve) { setTimeout(resolve, ms); });
+}
+
+var CATS = ["spiritual", "self-love", "financial", "growth"];
 var CAT_INFO = {
   spiritual: { label: "Spiritual", labelJa: "\u30B9\u30D4\u30EA\u30C1\u30E5\u30A2\u30EB", color: "#9b7fd4", bg: "#f0eaf8", accent: "#7c5cbf" },
   financial: { label: "Financial", labelJa: "\u30D5\u30A1\u30A4\u30CA\u30F3\u30B9", color: "#6aaa6e", bg: "#eaf5eb", accent: "#4a8f4e" },
@@ -224,6 +251,10 @@ function tf(user, key) {
   return (TXT[lang] && TXT[lang][key]) || TXT.en[key] || function() { return ""; };
 }
 
+function l(user, en, ja) {
+  return (user && user.lang === "ja") ? ja : en;
+}
+
 // ─── FULL 90-DAY PROGRAM ───
 // Phase 1 (Days 1-15): AWAKENING — Foundation practices
 // Phase 2 (Days 16-30): DEEPENING — Emotional & shadow work
@@ -232,684 +263,97 @@ function tf(user, key) {
 // Phase 5 (Days 61-75): INTEGRATING — Authentic living
 // Phase 6 (Days 76-90): RADIATING — Wisdom & legacy
 
-var DAYS = [
-  // ──── PHASE 1: AWAKENING (Days 1-15) ────
-  { t:"The Seed of Gratitude", c:"spiritual",
-    i:"Welcome to Day 1 of your Lumina journey. Today we plant the first seed \u2014 gratitude. Find a quiet place and close your eyes. Think of three things you are grateful for. Not the obvious ones. The small, hidden gifts: the warmth of morning light, the sound of your own breathing, a kind word someone offered. In your paper journal, write each one slowly. Let it sink into your heart before moving on. Gratitude is the soil from which all inner growth begins.",
-    m:"I am grateful for the abundance that already surrounds me." },
-  { t:"The Art of Arriving", c:"spiritual",
-    i:"Before we can grow, we must learn to arrive \u2014 to be fully here. Today, practice arriving. Sit for three minutes and simply notice: the weight of your body in the chair, the temperature of the air, the sounds around you. Do not judge or analyze. Just notice. In your journal, write what you observed. Most of us spend our lives somewhere other than where we are. Today, you practiced the radical act of being present.",
-    m:"I am fully here, fully alive, in this moment." },
-  { t:"The Mirror Within", c:"self-love",
-    i:"Stand before a mirror \u2014 or simply close your eyes and picture yourself. What do you see? Not the flaws your mind rushes to name, but the whole being who has survived every difficult day. In your journal, write a letter to yourself as though writing to someone you love deeply. What would you say? What would you forgive? What would you celebrate? Self-compassion is not weakness. It is the bravest thing you will ever practice.",
-    m:"I love myself unconditionally, exactly as I am." },
-  { t:"Your Relationship with Abundance", c:"financial",
-    i:"Money is energy \u2014 nothing more, nothing less. Today, examine your relationship with it without judgment. In your journal, write honestly: how does money make you feel? Anxiety? Freedom? Guilt? Shame? Now reflect on a belief about money you inherited from your family. Write it down. Ask yourself: is this belief still serving me? Today is simply about awareness. You cannot transform what you refuse to see.",
-    m:"I am worthy of abundance in all its forms." },
-  { t:"The Comfort Zone Map", c:"growth",
-    i:"Draw a circle in your journal. Inside it, write everything that feels safe and familiar. Outside the circle, write the things that excite you, scare you, or make you feel alive. Look at both lists. Growth does not happen inside the circle \u2014 it lives at the edge. Choose one thing from outside and commit to the smallest possible step toward it this week. Not a leap. A step.",
-    m:"I expand beyond my limits with courage and grace." },
-  { t:"Five Minutes of Stillness", c:"spiritual",
-    i:"Set a timer for five minutes. Sit comfortably and close your eyes. Breathe naturally. When thoughts arise \u2014 and they will \u2014 do not fight them. Imagine each thought is a leaf floating down a stream. Acknowledge it and let it pass. Return to the breath. Afterward, journal what came up. What did the silence reveal? Stillness is not the absence of noise. It is the presence of awareness.",
-    m:"In stillness, I find the answers I have been seeking." },
-  { t:"Honoring the Body", c:"self-love",
-    i:"Your body has carried you through every moment of your life without once asking for thanks. Place your hands over your heart and feel it beating \u2014 it has done this billions of times for you. In your journal, list five things your body does that you rarely acknowledge. Then today, do one kind thing for it: stretch slowly, drink water with intention, rest when tired. Your body is not an obstacle to your spiritual life. It is the vehicle.",
-    m:"My body is sacred, and I treat it with reverence." },
-  { t:"The Stories We Carry", c:"growth",
-    i:"We all carry a narrative about who we are \u2014 stories about our worth, our limits, our future. Today, write down the story you tell yourself most often. Read it back slowly. Is it true? Is it kind? Is it the story your wisest self would tell? Now write a new version. Not fantasy \u2014 but the version that honors your full potential. You are not rewriting reality. You are choosing which story gets your energy.",
-    m:"I am the author of my story, and I choose to write it with love." },
-  { t:"Sacred Morning", c:"spiritual",
-    i:"How you begin your morning shapes the texture of your entire day. Today, design a simple morning ritual \u2014 even just ten minutes. Perhaps a moment of gratitude, three deep breaths, a quiet intention for the day, or reading something that nourishes your spirit. Write this ritual in your journal. Tomorrow, practice it. A sacred morning does not require religion. It requires attention.",
-    m:"Each morning is a sacred invitation to begin again." },
-  { t:"The Flow of Giving", c:"financial",
-    i:"Abundance is a cycle. It flows in and it must flow out. Today, reflect on your relationship with generosity. When did you last give without expecting anything in return? In your journal, plan one act of giving this week. It does not need to be money \u2014 your time, your full attention, a kind word \u2014 these are currencies of the heart. Notice how giving makes you feel. Scarcity grasps. Abundance flows.",
-    m:"As I give freely, abundance flows back to me." },
-  { t:"The Art of Saying No", c:"self-love",
-    i:"Saying no is one of the deepest acts of self-love. Today, reflect honestly on where you say yes when your heart whispers no. Who drains your energy? What obligations feel hollow? In your journal, write about one boundary you need to set. Then practice saying it out loud: No, and that is okay. Your peace is not negotiable. Every yes to something you do not mean is a no to yourself.",
-    m:"I honor my needs by setting loving boundaries." },
-  { t:"Walking Meditation", c:"spiritual",
-    i:"Today your practice leaves the cushion. Go for a slow, deliberate walk \u2014 even ten minutes. Feel each footstep: the heel touching ground, the roll through the arch, the push of your toes. Notice the air on your skin. Listen to the world without naming what you hear. Walking meditation teaches us that mindfulness is not something we do in special moments. It is how we can live every moment. Journal what you noticed.",
-    m:"Every step I take is a prayer of presence." },
-  { t:"Breath as Anchor", c:"spiritual",
-    i:"Your breath is the only thing that is always with you and always in the present moment. Today, practice conscious breathing three times: once in the morning, once midday, once before sleep. Each time, take five slow breaths. Inhale for four counts, hold for two, exhale for six. In your journal, write about how your state of mind shifted with each practice. The breath is your anchor in any storm.",
-    m:"My breath connects me to the peace within." },
-  { t:"The Gratitude Deepening", c:"spiritual",
-    i:"On Day 1, you listed things you were grateful for. Today we go deeper. Choose one of those things and sit with it for five minutes. Close your eyes and really feel the gratitude \u2014 not as a thought, but as a sensation in your body. Where do you feel it? What does it feel like? In your journal, describe the physical experience of gratitude. When gratitude moves from the mind to the body, it becomes transformative.",
-    m:"Gratitude is not just a thought. It is a way of being." },
-  { t:"Impermanence", c:"growth",
-    i:"Everything changes. The weather, your mood, the cells in your body, the people in your life. Today, sit quietly and reflect on impermanence \u2014 not with sadness, but with awe. In your journal, write about something you once clung to that has passed. Did life continue? Did you survive? Impermanence is not the enemy. Resistance to it is. When we accept that nothing lasts, we learn to treasure what is here now.",
-    m:"I embrace change as the nature of all things." },
+var PROGRAM_CONTENT = { en: null, ja: null };
+var PROGRAM_CONTENT_PROMISE = null;
 
-  // ──── PHASE 2: DEEPENING (Days 16-30) ────
-  { t:"Meeting Your Shadow", c:"growth",
-    i:"Within each of us lives a shadow \u2014 the parts we hide, deny, or reject. Today, we begin to meet it gently. In your journal, write about a quality in others that deeply irritates you. Now ask: where does this quality live in me? Shadow work is not about shame. It is about wholeness. You cannot become your fullest self while exiling parts of who you are.",
-    m:"I embrace all parts of myself with compassion." },
-  { t:"The Forgiveness Inquiry", c:"self-love",
-    i:"Forgiveness is not about the other person. It is about releasing the weight you carry. Today, bring to mind someone you have not forgiven \u2014 perhaps even yourself. In your journal, write: What am I still holding? What would it feel like to set it down? You do not need to forgive today. Simply inquire. Feel the edges of the wound. Healing begins not with resolution, but with honest looking.",
-    m:"I release what no longer serves my peace." },
-  { t:"Emotional Weather Report", c:"self-love",
-    i:"Today, check in with yourself as you would check the weather. What is the emotional climate inside you right now? Cloudy? Stormy? Clear? Name it without trying to change it. In your journal, write your emotional weather report three times today: morning, afternoon, evening. Notice how emotions are like weather \u2014 they move, they shift, they are never permanent. You are the sky, not the clouds.",
-    m:"I observe my emotions with compassion, not judgment." },
-  { t:"The Wanting Mind", c:"financial",
-    i:"The mind that always wants more is the mind that can never rest. Today, notice your desires as they arise \u2014 wanting food, wanting approval, wanting things, wanting to be somewhere else. Each time you notice, pause and ask: what is the wanting beneath the wanting? In your journal, trace one desire to its root. Often, what we think we want is a proxy for something deeper: safety, love, or belonging.",
-    m:"I have enough. I am enough. This moment is enough." },
-  { t:"Sitting with Discomfort", c:"growth",
-    i:"Growth happens not when things are easy, but when we learn to stay with what is difficult. Today, sit in meditation for seven minutes. When discomfort arises \u2014 an itch, a restless thought, boredom \u2014 do not move. Simply observe it. Notice its texture, its intensity, how it changes. In your journal, describe the experience. Learning to sit with discomfort in stillness teaches you to sit with discomfort in life.",
-    m:"I am strong enough to sit with what is difficult." },
-  { t:"The Inner Critic", c:"self-love",
-    i:"We all have an inner voice that criticizes, shames, and diminishes us. Today, listen for it. When you hear it speak, write down exactly what it says in your journal. Then ask: whose voice is this really? A parent? A teacher? A culture? Now write a response from your wisest, most loving self. The inner critic is not your enemy. It is a frightened part of you that needs compassion, not combat.",
-    m:"I speak to myself with the kindness I deserve." },
-  { t:"Conscious Consumption", c:"financial",
-    i:"Today, pay attention to everything you consume: food, media, conversations, purchases. Before each act of consumption, pause and ask: does this nourish me or deplete me? In your journal tonight, make two lists: what nourished you today and what depleted you. This is not about restriction. It is about choosing with awareness. What you consume becomes the material of your inner life.",
-    m:"I choose to nourish my body, mind, and spirit with intention." },
-  { t:"Loving-Kindness Practice", c:"spiritual",
-    i:"Sit quietly and bring to mind someone you love. Silently offer them these words: May you be happy. May you be healthy. May you be safe. May you live with ease. Feel the warmth of this offering. Now direct the same words to yourself. Then to a stranger. Then to someone difficult. In your journal, write about where it was easy and where it was hard. This practice rewires the heart toward compassion.",
-    m:"May all beings be happy, healthy, safe, and at peace." },
-  { t:"Your Relationship with Time", c:"growth",
-    i:"Most suffering comes from living in the past or the future rather than the present. Today, notice how often your mind leaves now. Are you replaying yesterday? Rehearsing tomorrow? Each time you notice, gently return to what is in front of you. In your journal, write about your relationship with time. Do you feel you have enough? Where does time seem to disappear? Time is not the problem. Our relationship with it is.",
-    m:"I trust the timing of my life." },
-  { t:"Body Scan Meditation", c:"self-love",
-    i:"Lie down or sit comfortably. Starting at the top of your head, slowly move your attention through your body: forehead, eyes, jaw, neck, shoulders, arms, hands, chest, belly, hips, legs, feet. At each area, notice sensation without judgment. Where is there tension? Ease? Nothing? This takes about ten minutes. In your journal, map what you found. The body holds what the mind tries to forget.",
-    m:"I listen to the wisdom my body carries." },
-  { t:"The Roots of Fear", c:"growth",
-    i:"Fear is the guardian of the comfort zone. Today, write about something you are currently afraid of. Then ask yourself three times: what am I really afraid of beneath this? Each answer takes you deeper. The surface fear is rarely the true one. At the root, most fears reduce to a few universal themes: being alone, being unworthy, losing control, or ceasing to exist. Name the root. It loses power in the naming.",
-    m:"I meet my fears with curiosity rather than avoidance." },
-  { t:"Non-Attachment Practice", c:"spiritual",
-    i:"Non-attachment does not mean not caring. It means holding things \u2014 people, outcomes, possessions, opinions \u2014 with an open hand instead of a clenched fist. Today, choose one thing you are gripping tightly: an expectation, a plan, a grudge. In your journal, write about what you are holding and what it might feel like to soften your grip. Not to let go. Just to hold more gently.",
-    m:"I hold life gently, with open hands and an open heart." },
-  { t:"The Pause", c:"self-love",
-    i:"Between stimulus and response, there is a space. In that space is your power. Today, practice The Pause. Three times today, before reacting to something \u2014 an email, a comment, an impulse \u2014 pause for three breaths. Then respond. In your journal, write about what happened in those pauses. What did you notice? What might you have done without the pause? This tiny space is where your freedom lives.",
-    m:"In the pause, I find my power to choose." },
-  { t:"Gratitude for Difficulty", c:"spiritual",
-    i:"This is an advanced gratitude practice. Today, bring to mind something difficult you have experienced \u2014 not to minimize the pain, but to look for what it taught you. What strength did it build? What wisdom did it offer? What compassion did it open? In your journal, write a letter of gratitude to a hardship. This is not toxic positivity. It is the honest recognition that suffering, too, can be a teacher.",
-    m:"Even in difficulty, I find the seeds of wisdom." },
-
-  // ──── PHASE 3: EXPANDING (Days 31-45) ────
-  { t:"Interconnection", c:"spiritual",
-    i:"Nothing exists in isolation. The food on your plate passed through countless hands. The air you breathe was exhaled by trees that drink the rain. Today, trace one ordinary thing \u2014 your morning coffee, your shirt, your water \u2014 back through all the lives and processes that brought it to you. In your journal, write this chain. When you see how connected everything is, loneliness becomes impossible and gratitude becomes inevitable.",
-    m:"I am woven into the fabric of all life." },
-  { t:"Compassion for Strangers", c:"self-love",
-    i:"Today, look at every person you encounter \u2014 in the street, at a store, in traffic \u2014 and silently acknowledge: this person has suffered. This person has known loss, fear, and loneliness, just like me. You do not need to say anything. Just let this recognition soften your gaze. In your journal tonight, write about how this shifted your day. Compassion is not pity. It is the recognition of shared humanity.",
-    m:"Every person I meet is fighting a battle I know nothing about." },
-  { t:"Right Speech", c:"growth",
-    i:"Before speaking today, pause and ask three questions: Is it true? Is it kind? Is it necessary? If it does not pass all three, let it go. In your journal tonight, write about what you noticed. How much of your speech was habitual? How much was reactive? How much was truly necessary? Words are not neutral \u2014 they create the world we live in. Speak as though your words are seeds you are planting.",
-    m:"I speak with truth, kindness, and intention." },
-  { t:"The Gift of Attention", c:"self-love",
-    i:"Today, give one person your complete, undivided attention. No phone, no wandering mind. Listen as though what they are saying is the most important thing in the world. Look at them fully. When they finish, pause before responding. In your journal, write about the experience \u2014 both how it felt to give that attention and what you received. Presence is the most generous gift you can offer another human being.",
-    m:"My full attention is the greatest gift I can give." },
-  { t:"Simplicity Practice", c:"financial",
-    i:"Today, do one thing to simplify your life. Clear one drawer, cancel one subscription, say no to one commitment, delete apps you do not use. Simplicity is not deprivation \u2014 it is the removal of everything that distracts you from what matters. In your journal, write about what you simplified and how it felt. Every possession, commitment, and distraction you release creates space for what truly nourishes you.",
-    m:"I create space for what truly matters." },
-  { t:"Tonglen: Breathing In Suffering", c:"spiritual",
-    i:"This ancient practice transforms how we relate to pain. Sit quietly. On the inhale, imagine breathing in the suffering of someone you know \u2014 their grief, fear, or confusion. On the exhale, breathe out relief, love, and peace toward them. Start with one person. In your journal, write about the experience. Tonglen teaches us that we do not need to run from suffering. We can transform it through the alchemy of compassion.",
-    m:"I have the courage to hold space for suffering and transform it into love." },
-  { t:"Digital Sabbath", c:"growth",
-    i:"Today, take a break from screens for as long as you can. No social media, no news, no mindless scrolling. If a full day is impossible, choose four hours. Notice what arises in the space: restlessness? Relief? Boredom? Creativity? In your journal, document the experience. Our devices fill every gap where insight might grow. Sometimes the most radical thing you can do is create an unfilled space.",
-    m:"I am not my notifications. I am the awareness behind them." },
-  { t:"Equanimity", c:"spiritual",
-    i:"Equanimity is the ability to remain balanced in the face of both pleasant and unpleasant experiences. Today, when something good happens, notice without grasping. When something unpleasant happens, notice without aversion. Simply observe both with the same steady awareness. In your journal, write about moments of grasping and aversion you noticed. Equanimity is not indifference \u2014 it is engaged, compassionate balance.",
-    m:"I meet both joy and difficulty with a steady heart." },
-  { t:"Service Without Recognition", c:"financial",
-    i:"Do something kind for someone today without telling anyone about it and without expecting acknowledgment. It can be small: pay for a stranger's coffee, leave an encouraging note, quietly help someone struggling. Tell no one. Write about it only in your journal. Service that seeks recognition is performance. Service that remains invisible is practice. Notice what it feels like to give with no audience.",
-    m:"I serve not for recognition but because it is my nature to give." },
-  { t:"Contemplating Death", c:"spiritual",
-    i:"This is not morbid \u2014 it is one of the most clarifying practices in contemplative traditions. Sit quietly and acknowledge: one day, this body will stop. This is not a threat. It is a fact that gives today its urgency and beauty. In your journal, write: if I had one year left, what would I stop doing? What would I start? Who would I call? The awareness of death does not diminish life. It illuminates it.",
-    m:"Because this life is finite, every moment is precious." },
-  { t:"Nature as Teacher", c:"growth",
-    i:"Spend time outdoors today \u2014 even fifteen minutes. Do not listen to music or podcasts. Just be in nature. Notice how a tree grows without hurrying. How water flows around obstacles rather than fighting them. How seasons change without resistance. In your journal, write about one lesson nature offered you today. We do not need to look far for spiritual teachers. The earth has been practicing wisdom for billions of years.",
-    m:"Nature teaches me patience, resilience, and surrender." },
-  { t:"The Middle Way", c:"spiritual",
-    i:"Extreme effort exhausts. Extreme laziness stagnates. Today, reflect on where you tend toward extremes: overworking or avoiding, over-giving or withdrawing, indulgence or deprivation. The middle path is not mediocrity \u2014 it is the razor's edge of balanced effort. In your journal, identify one area where you could move toward balance. Wisdom lives not in the extremes but in the space between them.",
-    m:"I walk the path of balance with grace and awareness." },
-  { t:"Compassion for Your Past Self", c:"self-love",
-    i:"Think of a decision you made that you now regret. Now consider: with the information, maturity, and emotional resources you had at that time, could you truly have done differently? Probably not. In your journal, write a letter to the version of yourself who made that decision. Offer understanding, not judgment. You did what you could with what you had. That deserves compassion, not punishment.",
-    m:"I forgive my past self for not knowing what I know now." },
-
-  // ──── PHASE 4: TRANSFORMING (Days 46-60) ────
-  { t:"Rewriting Core Beliefs", c:"growth",
-    i:"We carry beliefs so deep we mistake them for facts: I am not enough. The world is not safe. I do not deserve love. Today, write down three beliefs that run your life. For each, ask: when did I first learn this? Is it absolutely true? Who would I be without this belief? In your journal, write a replacement for each \u2014 not an opposite, but a more complete truth. This is some of the most powerful work you will ever do.",
-    m:"I release beliefs that limit me and embrace truths that free me." },
-  { t:"Purpose as Practice", c:"growth",
-    i:"Purpose is not a destination you arrive at but a direction you walk. Today, reflect on what makes you lose track of time, what breaks your heart about the world, and what you would do if money were irrelevant. In your journal, look for where these three overlap. You do not need to find your purpose today. Just notice where purpose might already be quietly living in your life.",
-    m:"My purpose reveals itself when I listen with my heart." },
-  { t:"Abundance Mindset", c:"financial",
-    i:"Scarcity whispers: there is not enough. Abundance replies: there is always more where that came from. Today, catch yourself in scarcity thinking \u2014 about money, time, love, opportunity. Each time, gently replace it with an abundance truth. In your journal, track your scarcity thoughts and write their abundance counterparts. This is not about ignoring reality. It is about refusing to let fear be the lens through which you see everything.",
-    m:"The universe is generous, and I am open to receiving." },
-  { t:"The Witness", c:"spiritual",
-    i:"Today, practice being The Witness. Go through your day observing yourself as though watching a character in a film. Watch yourself eat, talk, react, feel. Do not judge the character. Simply observe. In your journal, write what The Witness noticed that the character would have missed. This practice reveals the space between you and your experiences \u2014 and in that space, freedom lives.",
-    m:"I am not my thoughts. I am the awareness that observes them." },
-  { t:"Generosity Beyond Money", c:"financial",
-    i:"Make a list in your journal of ten ways you can be generous that cost nothing: your time, your skills, a listening ear, a compliment, your patience, sharing knowledge, a letter of appreciation, holding a door with presence, cooking for someone, forgiving a debt of the heart. Choose three and practice them today. True wealth is measured not by what you have but by what you freely give.",
-    m:"I am rich in ways that cannot be counted." },
-  { t:"Meditation on Emptiness", c:"spiritual",
-    i:"Sit for ten minutes. Instead of focusing on an object, rest in the space between thoughts. When a thought comes, let it dissolve and notice the gap before the next one. Rest in that gap. It may be brief at first \u2014 a half-second of pure awareness. That gap is not nothing. It is the ground of everything. In your journal, describe the experience, even if it felt like nothing happened. Nothing is sometimes the most profound something.",
-    m:"In emptiness, I find the fullness of being." },
-  { t:"Values Inventory", c:"growth",
-    i:"List your ten most important values: not what you think they should be, but what actually drives your choices. Now look at how you spent last week. How much alignment is there between your values and your time? In your journal, write about the gaps you see. When we live out of alignment with our values, we feel empty even when we have everything. Alignment is the quiet secret to a meaningful life.",
-    m:"I live in alignment with what truly matters to me." },
-  { t:"The Second Arrow", c:"self-love",
-    i:"The Buddha taught that pain is inevitable, but suffering is optional. The first arrow is what happens to you. The second arrow is the story you tell about it: why me, this always happens, I cannot handle this. Today, when something unpleasant occurs, notice the first arrow and watch for the second. In your journal, describe both arrows. Can you receive the first without shooting the second? This is the path to freedom from unnecessary suffering.",
-    m:"I feel my pain without adding to it with stories." },
-  { t:"Visualization Practice", c:"growth",
-    i:"Close your eyes and imagine your life one year from now, lived in full alignment with your deepest values. See it in detail: where you are, how your morning unfolds, what your work looks like, how your relationships feel, what your inner state is. Spend ten minutes in this vision. In your journal, describe it vividly. Visualization is not fantasy. It is the practice of making the invisible visible, so your actions can follow.",
-    m:"I see my highest life clearly, and I move toward it daily." },
-  { t:"Investigating Reactivity", c:"self-love",
-    i:"Today, pay close attention to moments when you react strongly to something \u2014 anger, defensiveness, hurt. Instead of following the reaction, pause and investigate it with curiosity. Where did you feel it in your body? What triggered it? What older wound does it connect to? In your journal, map one reactive moment in detail. Reactivity is the unconscious past hijacking the present. Awareness breaks the chain.",
-    m:"I respond from presence, not from old wounds." },
-  { t:"Radical Acceptance", c:"spiritual",
-    i:"Acceptance does not mean approval. It means acknowledging what is without waging war against reality. Today, choose one situation in your life that you have been resisting. Sit with it and say: this is how it is right now. Not forever. Just now. In your journal, write about the difference between acceptance and resignation. Resistance exhausts. Acceptance frees your energy for the only question that matters: what now?",
-    m:"I accept what is and trust my power to shape what comes next." },
-  { t:"Joy as Practice", c:"self-love",
-    i:"We practice gratitude, compassion, and patience. But how often do we practice joy? Today, intentionally create three moments of joy: listen to a song that moves you, watch the light change at sunset, savor a single bite of food with complete attention. In your journal, describe each moment. Joy is not frivolous. In contemplative traditions, it is considered a sign of spiritual maturity \u2014 the ability to be delighted by ordinary things.",
-    m:"I give myself permission to experience deep, uncomplicated joy." },
-
-  // ──── PHASE 5: INTEGRATING (Days 61-75) ────
-  { t:"Right Livelihood", c:"financial",
-    i:"How you earn your living is a spiritual practice. Today, reflect honestly on your work. Does it contribute to the wellbeing of others? Does it align with your values? Does it allow you to express your gifts? In your journal, write about what would need to change \u2014 even slightly \u2014 for your work to feel more aligned. You do not need to quit your job. Sometimes right livelihood begins with a shift in intention, not a change in title.",
-    m:"My work is an expression of my deepest values." },
-  { t:"Relationship as Mirror", c:"self-love",
-    i:"Every close relationship is a mirror, reflecting back parts of ourselves we cannot otherwise see. Today, choose one important relationship and ask: what does this person reflect back to me? What do I admire in them that lives dormant in me? What irritates me that I have not accepted in myself? In your journal, explore this mirror honestly. The people closest to us are our most powerful \u2014 and most uncomfortable \u2014 teachers.",
-    m:"My relationships teach me what I am ready to learn." },
-  { t:"Beginner's Mind", c:"spiritual",
-    i:"In the beginner's mind, there are many possibilities. In the expert's mind, there are few. Today, approach one familiar activity \u2014 brushing your teeth, making coffee, your commute \u2014 as if experiencing it for the very first time. Notice everything. In your journal, write what you discovered. When we think we know something, we stop seeing it. Beginner's mind is the antidote to the blindness of routine.",
-    m:"I approach each moment with fresh eyes and an open heart." },
-  { t:"Honest Inventory", c:"growth",
-    i:"Today requires courage. In your journal, make three lists. Things I am proud of this year. Things I am avoiding. Truths I am not telling myself. Be ruthlessly honest \u2014 this journal is for your eyes only. Then sit with what you wrote without trying to fix anything. The most transformative thing you can do is look clearly at your life without flinching. Clarity always precedes meaningful change.",
-    m:"I have the courage to see my life clearly." },
-  { t:"Energy Audit", c:"self-love",
-    i:"Everything in your life either gives you energy or takes it. Today, in your journal, list the people, activities, environments, habits, and commitments that energize you and those that drain you. Be honest. Now circle one draining item you are willing to reduce or release, and one energizing item you are willing to increase. Your energy is finite and sacred. Spend it with the same care you would spend your last dollar.",
-    m:"I protect my energy and invest it wisely." },
-  { t:"Sitting with Joy and Sorrow", c:"spiritual",
-    i:"Life contains both joy and sorrow, often simultaneously. A beautiful sunset reminds us of someone who is gone. A child's laughter exists in a world that contains suffering. Today, sit for ten minutes and hold both joy and sorrow at once. Do not choose. Hold both. In your journal, write about the experience. The heart that can hold paradox is the heart that is truly awake.",
-    m:"My heart is big enough to hold both joy and sorrow." },
-  { t:"The Practice of Enough", c:"financial",
-    i:"There is a point where you have enough \u2014 enough food, enough shelter, enough comfort. Beyond that point, more does not create more happiness. It often creates more anxiety. Today, in your journal, define what enough looks like for you: in money, possessions, achievement, social approval. Be specific. The person who knows they have enough is the richest person in any room.",
-    m:"I know what enough is, and I celebrate it." },
-  { t:"Authentic Expression", c:"growth",
-    i:"Where in your life are you performing a version of yourself that is not true? Where do you dim your light to make others comfortable, or amplify it to win approval? Today, in one interaction, experiment with dropping the performance. Say what you actually think. Express what you actually feel. Not aggressively \u2014 but honestly. In your journal, write about what it felt like. Authenticity is terrifying because it risks rejection. But it is the only path to genuine connection.",
-    m:"I am worthy of love exactly as I am, not as I perform." },
-  { t:"Forgiveness Ceremony", c:"self-love",
-    i:"Today, write a letter you will never send. Address it to someone who hurt you \u2014 or to yourself for a self-inflicted wound. Write everything: the anger, the grief, the confusion. Do not edit. When you are finished, read it once. Then tear it up, burn it safely, or bury it. This is not for them. This is for you. In your journal, write about what you released. Some things can only be put down through ceremony.",
-    m:"I set down what I have carried too long, and I walk forward lighter." },
-  { t:"Mindful Communication", c:"growth",
-    i:"Today, in every conversation, practice this sequence: listen fully without planning your response. Pause before speaking. Respond rather than react. Notice the difference between listening to understand and listening to reply. In your journal, write about one conversation where you practiced this fully. Most conflicts arise not from what is said but from what is not heard. Deep listening heals.",
-    m:"I listen with my whole being and speak from my heart." },
-
-  // ──── PHASE 6: RADIATING (Days 76-90) ────
-  { t:"Teaching What You Know", c:"spiritual",
-    i:"The best way to deepen your understanding is to share it. Today, share one insight from this journey with someone \u2014 a friend, a family member, a colleague. Not as advice. Not as superiority. But as an offering: something you learned about yourself. In your journal, write about the exchange. Teaching is not about being an expert. It is about being honest. Every time you share authentically, you learn it again for the first time.",
-    m:"As I share what I have learned, my understanding deepens." },
-  { t:"Legacy Meditation", c:"growth",
-    i:"Close your eyes and imagine it is the end of your life. Not to frighten you, but to clarify. How do you want to be remembered? Not for what you achieved, but for how you made people feel. In your journal, write your own eulogy \u2014 not as it would be today, but as you want it to be. What qualities define you? What impact did you leave? Now ask: what can I do today to move toward that person?",
-    m:"I live each day as a contribution to the legacy I wish to leave." },
-  { t:"Advanced Loving-Kindness", c:"spiritual",
-    i:"On Day 24, you practiced basic loving-kindness. Today, extend it to its full range. Offer the phrases to: yourself, a loved one, a friend, a neutral person, a difficult person, and finally all beings everywhere. Spend two minutes on each. May you be happy. May you be healthy. May you be safe. May you live with ease. In your journal, write about where your heart opened and where it resisted. The resistance is where the practice is.",
-    m:"My compassion has no boundaries." },
-  { t:"Defining True Wealth", c:"financial",
-    i:"In your journal, answer this question without thinking too long: If I lost everything material tomorrow, what would remain? Write about the wealth that cannot be taken: your wisdom, your capacity to love, your resilience, your relationships, your ability to start again. These are your true assets. Today, invest in one of them. Call someone you love. Learn something. Sit in gratitude. Real wealth compounds in the heart.",
-    m:"My true wealth is measured by what remains when everything else is stripped away." },
-  { t:"Solitude Practice", c:"spiritual",
-    i:"Today, spend thirty minutes in complete solitude. No phone, no book, no music. Just you. Sit somewhere comfortable and let yourself be. Do not meditate formally. Just exist without stimulus or agenda. In your journal, write about what arose. For many, solitude is frightening because it strips away all the distractions we use to avoid ourselves. But in that stripped-down space, you meet the one person you can never escape: yourself.",
-    m:"I am comfortable in the company of my own being." },
-  { t:"Life as Practice", c:"growth",
-    i:"For the past eighty days, you have been practicing specific exercises. Today, recognize that everything is practice. Making breakfast is practice. Driving is practice. A disagreement is practice. A sunset is practice. In your journal, describe three ordinary moments from today and identify what each one offered you as a practice. When all of life becomes the practice, there is no separation between the spiritual and the mundane.",
-    m:"Every moment is an opportunity to practice awareness." },
-  { t:"The Bodhisattva Vow", c:"spiritual",
-    i:"In Buddhist tradition, a Bodhisattva is one who seeks awakening not just for themselves but for all beings. Today, sit quietly and make your own version of this vow. Not as religion, but as intention. In your journal, write: What do I wish for all beings? What am I willing to practice so that my awakening serves others? Spiritual growth that serves only the self eventually becomes a prison. Growth that serves all becomes liberation.",
-    m:"My growth serves not only me but all beings." },
-  { t:"Reviewing Your Journey", c:"self-love",
-    i:"Go back through your paper journal from Day 1 to today. Read without judgment. Notice how your handwriting may have changed, how your insights deepened, how themes evolved. In your journal today, write about the version of you who started this journey. What would you say to that person? What do you appreciate about their courage? You are not the same person who began this. Honor both who you were and who you are becoming.",
-    m:"I honor every version of myself that brought me here." },
-  { t:"Interdependence Meditation", c:"spiritual",
-    i:"Sit quietly and contemplate this: you did not create yourself. Your body was built from food grown in soil, fed by rain, energized by sun. Your mind was shaped by every person who ever spoke to you, every book you read, every experience you survived. You are a collaboration between the entire universe and this particular moment. In your journal, write about what interdependence means for how you live. No one is self-made. Everyone is everything-made.",
-    m:"I am a collaboration between the universe and this moment." },
-  { t:"Letting Go of the Path", c:"growth",
-    i:"A paradox of spiritual growth: the path that brought you here must eventually be released. The practices, the concepts, the identity of being a seeker \u2014 these are rafts, not destinations. Today, reflect on what you might be clinging to about this journey itself. In your journal, explore: can I keep growing without needing to call it growth? The finger pointing at the moon is not the moon. The practices are not the awakening. They are the doorway.",
-    m:"I release the path and trust the open road." },
-  { t:"Radical Generosity", c:"financial",
-    i:"Today, be radically generous in one way that stretches you slightly beyond comfort. Give more than feels easy \u2014 of your time, your money, your energy, your vulnerability. Not to the point of harm, but to the point of feeling the stretch. In your journal, write about what you gave and what it stirred in you. Generosity is a muscle. Like all muscles, it grows only when you push past the familiar range of motion.",
-    m:"I give boldly, and in giving, I discover my abundance." },
-  { t:"The Still Point", c:"spiritual",
-    i:"There is a place inside you that has never been touched by your story, your pain, your name, or your history. It is the still point at the center of the turning world. Today, sit for fifteen minutes and seek it. Not with effort. With surrender. Let everything else fall away \u2014 thoughts, feelings, identity \u2014 and rest in what remains. In your journal, write about whatever you found, even if it was nothing. Especially if it was nothing.",
-    m:"At the center of everything, there is peace." },
-  { t:"Writing Your Own Mantra", c:"self-love",
-    i:"For ninety days, you have been offered mantras. Today, write your own. Sit quietly and ask yourself: what does my soul most need to hear right now? Write whatever comes, then refine it until it feels true in your bones. Say it aloud three times. In your journal, write your mantra and why you chose these words. From now on, this is yours. No one gave it to you. It came from the same place wisdom has always come from: within.",
-    m:"I trust the wisdom that lives within me." },
-  { t:"The Final Reflection", c:"spiritual",
-    i:"You have arrived. Ninety days of showing up, of sitting with discomfort, of asking hard questions, of offering yourself compassion. In your journal, write freely about this journey. What surprised you? What changed? What remains unresolved? What will you carry forward? There is no graduation from the inner life \u2014 only deeper practice. But today, pause and acknowledge: you did something most people never do. You looked inward. You stayed. That took courage.",
-    m:"I am awake. I am grateful. I continue." },
-  { t:"The Continuation", c:"spiritual",
-    i:"Day 90 is not an ending. It is a commencement. Today, in your journal, design your own practice for the next season of your life. What will you keep from these 90 days? What new practices call to you? How will you continue to grow without a guided structure? The training wheels come off today. But the road continues. You now have everything you need. You always did. The journey simply helped you remember.",
-    m:"The journey never ends. I walk forward with an open heart." },
-  { t:"Gratitude as Legacy", c:"spiritual",
-    i:"Today, write a gratitude letter to someone who shaped you — a parent, teacher, friend, or stranger. Do not send it yet. Just write it fully, holding nothing back. Thank them for specific moments, words, and gifts they may not know they gave. In your journal, reflect on how gratitude expressed becomes a living legacy. When we name what others gave us, we complete a circle that blesses both giver and receiver.",
-    m:"My gratitude is a gift I give to those who shaped me." },
-  { t:"Conscious Money Practice", c:"financial",
-    i:"Today, track every financial transaction with full awareness. Before each purchase, pause and ask: does this reflect my values? After each one, notice how you feel — lighter, heavier, neutral? In your journal, review the day. Where was your spending conscious? Where was it automatic? Money is crystallized life energy. When we spend unconsciously, we leak vitality. When we spend with awareness, every transaction becomes a practice.",
-    m:"Every financial choice is an expression of my deepest values." },
-  { t:"The Courage to Be Seen", c:"self-love",
-    i:"Today, share something authentic with someone you trust — a dream, a fear, an imperfect truth about yourself. Not for validation, but for the practice of being genuinely seen. In your journal, write about the experience. What did vulnerability feel like in your body? What happened when you let someone see the real you? We spend so much energy curating a version of ourselves. True belonging requires the courage to show up as we are.",
-    m:"I let myself be truly seen, and in that vulnerability, I find connection." },
-  { t:"Designing Your Daily Practice", c:"growth",
-    i:"The structured 90-day journey is ending, but your practice continues. Today, design your own daily spiritual practice. Choose from what served you most: meditation, journaling, gratitude, loving-kindness, breath work, walking meditation, or something entirely new. Write it down in detail — when, where, how long. Keep it simple enough to sustain. In your journal, commit to this practice. Discipline is not the enemy of freedom. It is its foundation.",
-    m:"I design a practice that nourishes me every single day." },
-  { t:"The Sacred Ordinary", c:"spiritual",
-    i:"Today, treat every ordinary moment as sacred. Washing dishes becomes a meditation. Eating becomes a ceremony. Walking becomes a pilgrimage. Speaking becomes a prayer. There is no dividing line between the spiritual and the mundane — we only think there is. In your journal, describe three ordinary moments you made sacred today. When everything becomes practice, you realize there was never anywhere to get to. You were always already here.",
-    m:"Every ordinary moment holds the sacred within it." },
-  { t:"Legacy of Kindness", c:"self-love",
-    i:"Today, perform three deliberate acts of kindness: one for yourself, one for someone close, and one for a stranger. Make each one specific and intentional. For yourself: rest, nourishment, or beauty. For someone close: a letter, a gift of time, a genuine compliment. For a stranger: generosity without recognition. In your journal, write about all three. Kindness is not a luxury. It is the most practical spiritual practice that exists.",
-    m:"My kindness ripples outward and returns as peace." },
-  { t:"Abundance Flows Through Me", c:"financial",
-    i:"Today, reflect on all the ways abundance has flowed through your life — not just money, but love, opportunity, learning, beauty, health, friendship. Make an abundance inventory in your journal. Write at least twenty items. Then ask: am I a channel or a dam? Does abundance flow through me to others, or do I try to hold it all? The most prosperous people are those who allow abundance to move freely — receiving generously, giving generously.",
-    m:"I am a generous channel through which abundance flows to bless the world." },
-  { t:"Integration Day", c:"growth",
-    i:"Today is for integration. Sit quietly for twenty minutes and let the past eighty-seven days settle into your bones. Do not try to summarize or analyze. Just sit with it all. Then in your journal, write freely — whatever comes. Let your hand move without planning. This is not a test. There is nothing to achieve. Simply allow whatever has been planted in you to find its own expression. Trust the process. Trust yourself.",
-    m:"I trust that everything I have learned lives within me now." },
-  { t:"The Circle Completes", c:"self-love",
-    i:"Today, look at yourself with the same tenderness you would offer a dear friend. You have spent almost ninety days learning to be more present, more compassionate, more aware. In your journal, write a love letter to yourself — not about what you have accomplished, but about who you are. Not the improved version. The version that was always there, hidden beneath the noise. This is not the end of self-love. It is the moment you realize it was always the beginning.",
-    m:"I have always been worthy of the love I now give myself." },
-  { t:"Blessing and Release", c:"spiritual",
-    i:"Sit quietly and bring to mind this entire journey — the difficult days, the breakthrough moments, the days you did not want to practice but did anyway, the surprises and the silences. Bless it all. Thank this journey for what it taught you. Then, gently, release it. You do not need to hold onto the experience. It is now part of who you are. In your journal, write your blessing and release. Completion is its own kind of beginning.",
-    m:"I bless this journey and release it with an open heart." },
-  { t:"The Unending Path", c:"spiritual",
-    i:"Day 90. You have walked a path that most never begin. You have looked inward when it would have been easier to look away. You have sat with discomfort, offered yourself compassion, examined your beliefs, practiced generosity, and dared to grow. This journey has no graduation — only continuation. The path does not end here. It opens. In your journal, write your intention for the next chapter. You are ready. You always were.",
-    m:"I am complete, and I am just beginning." },
-];
-
-
-// Day-to-illustration mapping (0-19 illustration types per day theme)
-// Motif key: 0=Seed 1=Meditation 2=Mirror 3=Waves 4=Compass 5=Candle 6=Heart 7=Book 8=Sunrise 9=OpenHands 10=Tree 11=Path 12=Breath 13=Mountain 14=YinYang 15=Butterfly 16=Eye 17=Mandala 18=Doorway 19=Flame
-var DAY_ILLUS = [
-  // Phase 1: AWAKENING (Days 1-15)
-  0,  // 1  Seed of Gratitude → Seed
-  1,  // 2  Art of Arriving → Meditation (presence)
-  2,  // 3  Mirror Within → Mirror
-  3,  // 4  Relationship with Abundance → Waves (flow)
-  4,  // 5  Comfort Zone Map → Compass (direction)
-  1,  // 6  Five Minutes of Stillness → Meditation
-  6,  // 7  Honoring the Body → Heart (self-love)
-  7,  // 8  Stories We Carry → Book (stories)
-  8,  // 9  Sacred Morning → Sunrise
-  9,  // 10 Flow of Giving → Open Hands
-  11, // 11 Art of Saying No → Path (boundaries)
-  11, // 12 Walking Meditation → Path (walking)
-  12, // 13 Breath as Anchor → Breath
-  0,  // 14 Gratitude Deepening → Seed (gratitude)
-  10, // 15 Impermanence → Tree (cycles)
-  // Phase 2: DEEPENING (Days 16-30)
-  14, // 16 Meeting Your Shadow → Yin-Yang (shadow)
-  6,  // 17 Forgiveness Inquiry → Heart (forgiveness)
-  3,  // 18 Emotional Weather → Waves (emotions)
-  16, // 19 Wanting Mind → Eye (awareness)
-  13, // 20 Sitting with Discomfort → Mountain (endurance)
-  2,  // 21 Inner Critic → Mirror (self-reflection)
-  16, // 22 Conscious Consumption → Eye (awareness)
-  6,  // 23 Loving-Kindness → Heart (kindness)
-  12, // 24 Relationship with Time → Spirals (time)
-  1,  // 25 Body Scan → Meditation (body)
-  10, // 26 Root of Fear → Tree (roots)
-  9,  // 27 Letting Go → Open Hands
-  12, // 28 Space Between → Breath (pause)
-  13, // 29 Gratitude for Difficulty → Mountain (challenge)
-  17, // 30 Interconnection → Mandala
-  // Phase 3: EXPANDING (Days 31-45)
-  6,  // 31 Compassion for Strangers → Heart
-  7,  // 32 Right Speech → Book (words)
-  16, // 33 Gift of Attention → Eye (attention)
-  5,  // 34 Practice of Simplicity → Candle (simplicity)
-  12, // 35 Tonglen → Breath (breathing)
-  18, // 36 Digital Sabbath → Doorway (opening)
-  14, // 37 Equanimity → Yin-Yang (balance)
-  9,  // 38 Unseen Service → Open Hands (giving)
-  19, // 39 Meditating on Death → Flame (life)
-  10, // 40 Nature as Teacher → Tree (nature)
-  11, // 41 Middle Path → Path
-  2,  // 42 Compassion for Past Self → Mirror
-  7,  // 43 Rewriting Core Beliefs → Book (rewriting)
-  4,  // 44 Purpose as Practice → Compass (purpose)
-  8,  // 45 Abundance Mindset → Sunrise (openness)
-  // Phase 4: TRANSFORMING (Days 46-60)
-  16, // 46 The Observer → Eye (observing)
-  9,  // 47 Generosity Beyond Money → Open Hands
-  17, // 48 Meditation on Emptiness → Mandala
-  7,  // 49 Values Inventory → Book
-  13, // 50 The Second Arrow → Mountain (pain)
-  16, // 51 Visualization → Eye
-  19, // 52 Reactivity Inquiry → Flame
-  3,  // 53 Radical Acceptance → Waves (accepting)
-  15, // 54 Practice of Joy → Butterfly (joy)
-  4,  // 55 Right Livelihood → Compass (direction)
-  2,  // 56 Relationships as Mirrors → Mirror
-  8,  // 57 Beginner's Mind → Sunrise (fresh)
-  7,  // 58 Honest Inventory → Book
-  5,  // 59 Energy Audit → Candle (energy)
-  14, // 60 Joy and Sorrow → Yin-Yang (both)
-  // Phase 5: INTEGRATING (Days 61-75)
-  3,  // 61 Practice of Enough → Waves (flow)
-  19, // 62 Authentic Expression → Flame (passion)
-  6,  // 63 Forgiveness Ritual → Heart
-  7,  // 64 Mindful Dialogue → Book (dialogue)
-  5,  // 65 Teaching What You Know → Candle (light)
-  10, // 66 Legacy Meditation → Tree (roots)
-  17, // 67 Advanced Loving-Kindness → Mandala
-  0,  // 68 Defining True Wealth → Seed (true abundance)
-  13, // 69 Practice of Solitude → Mountain (alone)
-  11, // 70 Life as Practice → Path (journey)
-  6,  // 71 Bodhisattva Vow → Heart (compassion vow)
-  4,  // 72 Reviewing the Journey → Compass (review)
-  17, // 73 Interdependence → Mandala
-  18, // 74 Releasing the Path → Doorway (opening)
-  9,  // 75 Radical Generosity → Open Hands
-  // Phase 6: RADIATING (Days 76-90)
-  1,  // 76 Still Center → Meditation
-  7,  // 77 Writing Your Mantra → Book (writing)
-  2,  // 78 Final Reflection → Mirror
-  11, // 79 Continuation → Path
-  0,  // 80 Gratitude as Legacy → Seed (gratitude)
-  4,  // 81 Conscious Money → Compass
-  16, // 82 Courage to Be Seen → Eye
-  5,  // 83 Design Daily Practice → Candle
-  8,  // 84 Sacred Ordinary → Sunrise
-  6,  // 85 Legacy of Kindness → Heart
-  3,  // 86 Abundance Through Me → Waves (flowing)
-  1,  // 87 Integration Day → Meditation
-  17, // 88 Circle Completes → Mandala
-  15, // 89 Blessing and Release → Butterfly
-  18, // 90 Endless Path → Doorway (opening)
-];
-
-
-// ─── JAPANESE TRANSLATIONS FOR ALL 90 DAYS ───
-var JA_DAYS = {
-  t: [
-    "感謝の種",
-    "到着の技法",
-    "内なる鏡",
-    "豊かさとの関係",
-    "コンフォートゾーンの地図",
-    "五分間の静寂",
-    "身体を敬う",
-    "私たちが運ぶ物語",
-    "聖なる朝",
-    "与えることの流れ",
-    "断る技法",
-    "歩く瞑想",
-    "錨としての呼吸",
-    "感謝の深化",
-    "無常",
-    "影との出会い",
-    "赦しの探究",
-    "心の天気予報",
-    "欲望する心",
-    "不快と共に座る",
-    "内なる批判者",
-    "意識的な消費",
-    "慈悲の瞑想",
-    "時間との関係",
-    "ボディスキャン瞑想",
-    "恐れの根源",
-    "執着を手放す",
-    "間（ま）",
-    "困難への感謝",
-    "つながり",
-    "見知らぬ人への思いやり",
-    "正しい言葉",
-    "注意という贈り物",
-    "簡素の実践",
-    "トンレン：苦しみを吸い込む",
-    "デジタル安息日",
-    "平静",
-    "認められない奉仕",
-    "死を見つめる",
-    "自然という師",
-    "中道",
-    "過去の自分への思いやり",
-    "核心的信念の書き換え",
-    "実践としての目的",
-    "豊かさのマインドセット",
-    "観察者",
-    "お金を超えた寛大さ",
-    "空の瞑想",
-    "価値観の棚卸し",
-    "第二の矢",
-    "視覚化の実践",
-    "反応性の探究",
-    "根本的な受容",
-    "喜びの実践",
-    "正しい生計",
-    "鏡としての人間関係",
-    "初心",
-    "正直な棚卸し",
-    "エネルギーの監査",
-    "喜びと悲しみと共に座る",
-    "「足りている」の実践",
-    "本当の自己表現",
-    "赦しの儀式",
-    "マインドフルな対話",
-    "知っていることを教える",
-    "遺産の瞑想",
-    "慈悲の瞑想・上級",
-    "本当の豊かさを定義する",
-    "孤独の実践",
-    "人生は実践",
-    "菩薩の誓い",
-    "旅を振り返る",
-    "相互依存の瞑想",
-    "道を手放す",
-    "根本的な寛大さ",
-    "静寂の中心",
-    "自分のマントラを書く",
-    "最後の振り返り",
-    "継続",
-    "遺産としての感謝",
-    "意識的なお金の実践",
-    "見られる勇気",
-    "日々の実践をデザインする",
-    "聖なる日常",
-    "優しさの遺産",
-    "私を通して流れる豊かさ",
-    "統合の日",
-    "円が完成する",
-    "祝福と解放",
-    "終わりなき道",
-  ],
-  i: [
-    "ルミナの旅の第一日目へようこそ。今日、最初の種を植えます——感謝です。静かな場所を見つけ、目を閉じてください。感謝していることを三つ考えてください。当たり前のものではなく、小さな隠れた贈り物を。朝の光の温かさ、自分の呼吸の音、誰かがくれた優しい言葉。ノートにひとつずつゆっくりと書いてください。次に進む前に、心に染み込ませましょう。感謝は、すべての内なる成長が始まる土壌です。",
-    "成長する前に、まず到着することを学ばなければなりません——完全にここにいることを。今日は到着する練習をしましょう。三分間座って、ただ気づいてください。椅子に座る体の重さ、空気の温度、周りの音。判断も分析もせず、ただ気づくだけ。ノートに観察したことを書いてください。私たちの多くは、今いる場所以外のどこかで人生を過ごしています。今日、あなたは存在するという根本的な行為を実践しました。",
-    "鏡の前に立ってください——あるいは目を閉じて自分を思い浮かべてください。何が見えますか？心が急いで名前をつける欠点ではなく、困難な日々すべてを生き延びた存在全体を。ノートに、深く愛する人に書くように自分への手紙を書いてください。何を伝えますか？何を許しますか？何を祝いますか？自己慈悲は弱さではありません。あなたが実践する最も勇敢なことです。",
-    "お金はエネルギーです——それ以上でもそれ以下でもありません。今日、判断なしにお金との関係を見つめてください。ノートに正直に書いてください。お金はどんな気持ちにさせますか？不安？自由？罪悪感？恥？今、家族から受け継いだお金に関する信念を振り返ってください。書き出してください。問いかけてください。この信念はまだ自分のためになっているだろうか？今日はただ気づくことだけです。見ることを拒むものは変えられません。",
-    "ノートに円を描いてください。中に安全で馴染みのあるものをすべて書いてください。円の外に、ワクワクするもの、怖いもの、生きている実感がするものを書いてください。両方のリストを見てください。成長は円の中では起きません——それは端に生きています。外側からひとつ選び、今週中にそれに向かう最も小さな一歩を約束してください。飛躍ではなく、一歩を。",
-    "タイマーを五分にセットしてください。楽な姿勢で座り、目を閉じてください。自然に呼吸してください。考えが浮かんだら——必ず浮かびます——戦わないでください。それぞれの考えが川を流れる葉だと想像してください。認めて、流してください。呼吸に戻りましょう。終わったら、何が浮かんだかをノートに書いてください。静寂は音の不在ではありません。気づきの存在です。",
-    "あなたの体は、一度も感謝を求めることなく、人生のあらゆる瞬間を支えてきました。心臓の上に手を置き、鼓動を感じてください——何十億回もあなたのために打ってきました。ノートに、めったに感謝しない体がしてくれている五つのことを書いてください。そして今日、体に優しいことをひとつしてください。ゆっくりストレッチする、意識を込めて水を飲む、疲れたら休む。体はスピリチュアルな生活の障害ではありません。それは乗り物です。",
-    "私たちは皆、自分が誰かについての物語を持っています——自分の価値、限界、未来についての物語。今日、最もよく自分に語る物語を書いてください。ゆっくり読み返してください。それは本当ですか？優しいですか？最も賢い自分が語る物語ですか？新しいバージョンを書いてください。空想ではなく、あなたの全潜在能力を尊重するバージョンを。現実を書き換えるのではありません。どの物語にエネルギーを注ぐかを選んでいるのです。",
-    "朝の始め方が一日全体の質感を形作ります。今日、シンプルな朝の儀式をデザインしてください——たった十分でも。感謝の瞬間、三回の深い呼吸、一日への静かな意図、あるいは心を養う何かを読むこと。この儀式をノートに書いてください。明日、実践してください。聖なる朝に宗教は必要ありません。注意が必要なのです。",
-    "豊かさは循環です。流れ込み、流れ出さなければなりません。今日、寛大さとの関係を振り返ってください。最後に見返りを期待せずに与えたのはいつですか？ノートに今週の与える行為をひとつ計画してください。お金である必要はありません——時間、十分な注意、優しい言葉——これらは心の通貨です。与えることがどんな気持ちにさせるか注意してください。欠乏はしがみつきます。豊かさは流れます。",
-    "ノーと言うことは、最も深い自己愛の行為のひとつです。今日、心がノーと囁くのにイエスと言っている場所を正直に振り返ってください。誰があなたのエネルギーを奪っていますか？どんな義務が空虚に感じますか？ノートに設定する必要がある境界線をひとつ書いてください。声に出して練習してください。いいえ、それで大丈夫です。あなたの平和は交渉の対象ではありません。本心でないイエスは、自分へのノーです。",
-    "今日の実践は坐禅の場を離れます。ゆっくりと意図的な散歩に出かけてください——十分でも。一歩一歩を感じてください。かかとが地面に触れる感触、足裏のロール、つま先の押し出し。肌に当たる空気を感じてください。名前をつけずに世界の音を聴いてください。歩く瞑想は、マインドフルネスが特別な瞬間に行うものではないことを教えてくれます。すべての瞬間をそう生きることができるのです。",
-    "呼吸は、常にあなたと共にあり、常に今この瞬間にある唯一のものです。今日、意識的な呼吸を三回実践してください。朝、昼、就寝前に。毎回、ゆっくりと五回呼吸してください。四つ数えて吸い、二つ保持し、六つで吐く。ノートに、各実践で心の状態がどう変わったかを書いてください。呼吸はあらゆる嵐の中のあなたの錨です。",
-    "一日目にあなたは感謝していることをリストアップしました。今日はさらに深く入ります。そのひとつを選び、五分間じっと座ってください。目を閉じ、感謝を本当に感じてください——思考としてではなく、体の感覚として。どこで感じますか？どんな感じですか？ノートに感謝の身体的体験を描写してください。感謝が心から体に移ると、変容的になります。",
-    "すべては変わります。天気、気分、体の細胞、人生の人々。今日、静かに座り、無常について振り返ってください——悲しみではなく、畏敬の念を持って。ノートに、かつてしがみついていたけれど過ぎ去ったものについて書いてください。人生は続きましたか？生き延びましたか？無常は敵ではありません。それへの抵抗が敵なのです。何も永遠には続かないと受け入れるとき、今ここにあるものを大切にすることを学びます。",
-    "私たちの中には影が生きています——隠し、否定し、拒絶する部分。今日、優しくそれに出会いましょう。ノートに、他人の中で深くイライラする特質について書いてください。そして問いかけてください。この特質は自分のどこに生きているだろうか？シャドーワークは恥じることではありません。全体性を取り戻すことです。自分の一部を追放しながら、最も完全な自分にはなれません。",
-    "赦しは相手のためではありません。あなたが背負っている重荷を下ろすことです。今日、まだ赦していない誰か——おそらく自分自身を思い浮かべてください。ノートに書いてください。私はまだ何を握りしめているのか？それを置いたらどんな気持ちだろう？今日赦す必要はありません。ただ問いかけてください。傷の縁を感じてください。癒しは解決からではなく、正直に見つめることから始まります。",
-    "今日、天気を確認するように自分をチェックしてください。今、自分の内側の感情的な気候はどうですか？曇り？嵐？晴れ？変えようとせず名前をつけてください。ノートに今日三回、感情の天気予報を書いてください。朝、午後、夜。感情が天気のようなものであることに気づいてください——動き、変わり、決して永遠ではない。あなたは雲ではなく、空なのです。",
-    "常にもっと欲しがる心は、決して休めない心です。今日、欲望が生じるのに気づいてください——食べ物、承認、モノ、別の場所にいたいこと。気づくたびに立ち止まり、問いかけてください。この欲望の下にある欲望は何か？ノートにひとつの欲望をその根まで辿ってください。多くの場合、欲しいと思っているものは、もっと深いものの代理です。安全、愛、帰属感。",
-    "成長は物事が簡単なときではなく、困難なものと共に留まることを学ぶときに起こります。今日、七分間の瞑想をしてください。不快が生じたら——かゆみ、落ち着かない思考、退屈——動かないでください。ただ観察してください。その質感、強さ、変化に気づいてください。ノートに体験を描写してください。静寂の中で不快と共に座ることを学ぶことは、人生で不快と共に座ることを学ぶことです。",
-    "私たちの中には批判し、恥じ、小さくする内なる声があります。今日、その声に耳を傾けてください。聞こえたら、ノートに正確に言っていることを書いてください。そして問いかけてください。この声は本当は誰の声だろう？親？先生？文化？最も賢く、最も愛情深い自分からの返答を書いてください。内なる批判者はあなたの敵ではありません。戦いではなく、思いやりを必要としているあなたの怯えた部分です。",
-    "今日、消費するすべてのものに注意を払ってください。食べ物、メディア、会話、買い物。消費の行為の前に立ち止まり問いかけてください。これは私を養うか、消耗させるか？今夜ノートに二つのリストを作ってください。今日養われたものと消耗させたもの。これは制限ではありません。意識を持って選ぶことです。消費するものが内なる生活の素材になります。",
-    "静かに座り、愛する人を思い浮かべてください。心の中でこの言葉を贈ってください。あなたが幸せでありますように。健康でありますように。安全でありますように。安らかに暮らせますように。この贈り物の温かさを感じてください。次に同じ言葉を自分に向けてください。そして見知らぬ人に。そして困難な人に。ノートに簡単だったところと難しかったところを書いてください。この実践は心を思いやりに向けて書き換えます。",
-    "ほとんどの苦しみは、現在ではなく過去や未来に生きることから来ます。今日、心がどれくらい頻繁に「今」を離れるか気づいてください。昨日を再生していますか？明日のリハーサルをしていますか？気づくたびに、目の前にあることに優しく戻ってください。ノートに時間との関係について書いてください。十分にあると感じますか？時間はどこで消えるように思えますか？",
-    "横になるか楽な姿勢で座ってください。頭のてっぺんから始めて、ゆっくりと体中に注意を向けてください。額、目、顎、首、肩、腕、手、胸、腹、腰、脚、足。各部分で判断なしに感覚に気づいてください。緊張はどこにありますか？楽なところは？何もないところは？約十分かかります。ノートに見つけたことを描いてください。体は心が忘れようとするものを保持しています。",
-    "恐れはコンフォートゾーンの番人です。今日、現在恐れていることについて書いてください。そして三回自問してください。この下に本当に恐れているものは何か？答えのたびに深くなります。表面の恐れは本当の恐れであることはまれです。根元では、ほとんどの恐れはいくつかの普遍的なテーマに還元されます。孤独、無価値、制御の喪失、存在の消滅。根を名前をつけてください。名前をつけると力を失います。",
-    "非執着は気にしないことではありません。物事——人、結果、所有物、意見——を握りしめた拳ではなく開いた手で持つことです。今日、きつく握りしめているものをひとつ選んでください。期待、計画、恨み。ノートにあなたが握りしめているものと、その握りを緩めたらどんな感じがするかを書いてください。手放すのではなく、ただもっと優しく持つだけ。",
-    "刺激と反応の間に空間があります。その空間にあなたの力があります。今日、「間（ま）」を実践してください。今日三回、何かに反応する前に——メール、コメント、衝動——三回の呼吸分立ち止まってください。そして応答してください。ノートにその間で何が起きたかを書いてください。何に気づきましたか？間がなければ何をしていましたか？この小さな空間にあなたの自由が生きています。",
-    "これは高度な感謝の実践です。今日、困難な経験を思い浮かべてください——痛みを軽視するためではなく、それが教えてくれたことを探すために。どんな強さを築きましたか？どんな知恵を提供しましたか？どんな思いやりを開きましたか？ノートに困難への感謝の手紙を書いてください。これは有害なポジティブ思考ではありません。苦しみもまた師になり得るという正直な認識です。",
-    "何も孤立しては存在しません。あなたの皿の食べ物は無数の手を通り過ぎました。あなたが吸う空気は、雨を飲む木々が吐き出したものです。今日、ひとつの普通のもの——朝のコーヒー、シャツ、水——をそれを届けたすべての命とプロセスまで辿ってください。ノートにこの連鎖を書いてください。すべてがつながっていると見えるとき、孤独は不可能になり、感謝は必然になります。",
-    "今日、出会うすべての人を見て、心の中で認めてください。この人は苦しんだことがある。この人は私と同じように喪失、恐れ、孤独を知っている。何も言う必要はありません。ただこの認識があなたのまなざしを柔らかくするのを感じてください。今夜ノートに、これが一日をどう変えたか書いてください。思いやりは同情ではありません。共有された人間性の認識です。",
-    "今日話す前に、三つの質問で立ち止まってください。それは真実か？それは親切か？それは必要か？三つすべてを通らなければ、手放してください。今夜ノートに気づいたことを書いてください。あなたの言葉のどれくらいが習慣的でしたか？どれくらいが反射的でしたか？本当に必要だったのはどれくらいですか？言葉は中立ではありません——私たちが住む世界を創ります。",
-    "今日、ひとりの人にあなたの完全で途切れない注意を向けてください。電話なし、心のさまよいなし。彼らが言っていることが世界で最も重要なことであるかのように聴いてください。十分に見つめてください。終わったら、応答する前に間を置いてください。ノートにその体験を書いてください。存在は、あなたが他の人に贈れる最も寛大な贈り物です。",
-    "今日、生活を簡素にすることをひとつしてください。引き出しひとつを整理する、サブスクリプションをひとつ解約する、約束をひとつ断る。簡素さは欠乏ではありません——大切なことから気をそらすすべてを取り除くことです。ノートに何を簡素にしたか、どう感じたかを書いてください。手放すすべての所有物、約束、気晴らしが、本当に養うもののための空間を生み出します。",
-    "この古代の実践は、痛みとの関わり方を変容させます。静かに座ってください。吸う息で、知っている人の苦しみを吸い込むことを想像してください——彼らの悲しみ、恐れ、混乱を。吐く息で、安らぎ、愛、平和を彼らに向けて吐き出してください。一人から始めてください。ノートに体験を書いてください。トンレンは苦しみから逃げる必要がないことを教えてくれます。思いやりの錬金術で変容させることができるのです。",
-    "今日、できるだけ長くスクリーンから離れてください。SNSなし、ニュースなし、無意識のスクロールなし。丸一日が無理なら、四時間を選んでください。その空間に何が生じるか注意してください。落ち着きのなさ？安堵？退屈？創造性？ノートに体験を記録してください。デバイスは洞察が育つかもしれないあらゆる隙間を埋めます。最も根本的なことは、埋まっていない空間を作ることです。",
-    "平静は、快い経験も不快な経験も前にバランスを保つ能力です。今日、良いことが起きたら、しがみつかずに気づいてください。不快なことが起きたら、嫌悪せずに気づいてください。同じ安定した気づきで両方を観察してください。ノートにしがみつきと嫌悪の瞬間を書いてください。平静は無関心ではありません——関与した、思いやりのあるバランスです。",
-    "今日、誰にも言わず、認められることを期待せず、誰かに親切なことをしてください。小さなことでいい。見知らぬ人のコーヒーを払う、励ましのメモを残す、困っている人を静かに助ける。誰にも言わないでください。ノートだけに書いてください。認識を求める奉仕はパフォーマンスです。見えないままの奉仕は実践です。",
-    "これは病的ではありません——観想的伝統で最も明確にする実践のひとつです。静かに座り、認めてください。いつかこの体は止まる。これは脅しではありません。今日に緊急性と美しさを与える事実です。ノートに書いてください。あと一年しかなかったら、何をやめますか？何を始めますか？誰に電話しますか？死の意識は人生を減じません。照らすのです。",
-    "今日、屋外で過ごしてください——十五分でも。音楽やポッドキャストを聴かないでください。ただ自然の中にいてください。木が急がずに育つ様子に気づいてください。水が障害物と戦わずに流れる様子。季節が抵抗なく変わる様子。ノートに今日自然が教えてくれたレッスンをひとつ書いてください。スピリチュアルな師を遠くに探す必要はありません。地球は何十億年も知恵を実践してきました。",
-    "極端な努力は疲弊させます。極端な怠惰は停滞させます。今日、極端に傾きがちなところを振り返ってください。働きすぎか回避か、与えすぎか引きこもりか、耽溺か欠乏か。中道は凡庸ではありません——バランスの取れた努力の鋭い刃です。ノートにバランスに向かえる分野をひとつ特定してください。知恵は極端にではなく、その間の空間に生きています。",
-    "あなたが今後悔している決断を思い出してください。そして考えてください。そのときの情報、成熟、感情的なリソースで、本当に違うことができたでしょうか？おそらくできなかった。ノートに、その決断をした自分に手紙を書いてください。判断ではなく理解を贈ってください。持っているもので精一杯やった。それは罰ではなく、思いやりに値します。",
-    "私たちは事実と間違えるほど深い信念を持っています。「私は十分ではない」「世界は安全ではない」「私は愛に値しない」。今日、あなたの人生を動かしている三つの信念を書いてください。それぞれに問いかけてください。いつ初めてこれを学んだか？絶対に真実か？この信念なしに誰になるか？ノートに置き換えを書いてください——反対ではなく、より完全な真実を。",
-    "目的は到着する目的地ではなく、歩く方向です。今日、時間を忘れさせるもの、世界について心を痛めるもの、お金が関係なければ何をするかを振り返ってください。ノートにこの三つが重なるところを探してください。今日目的を見つける必要はありません。ただ、目的がすでに静かにあなたの人生に生きているかもしれない場所に気づいてください。",
-    "欠乏は囁きます。十分ではないと。豊かさは答えます。もっとあるところから来ていると。今日、お金、時間、愛、機会についての欠乏思考に気づいてください。毎回、優しく豊かさの真実に置き換えてください。ノートに欠乏の思考とその豊かさの対応を追跡してください。これは現実を無視することではありません。恐れをすべてを見るレンズにすることを拒否することです。",
-    "今日、「観察者」になる実践をしてください。映画のキャラクターを見ているかのように自分を観察しながら一日を過ごしてください。食べる自分、話す自分、反応する自分、感じる自分を見てください。キャラクターを判断しないでください。ただ観察してください。ノートに観察者が気づいたがキャラクターが見逃したであろうことを書いてください。この実践はあなたと経験の間の空間を明らかにします。その空間に自由があります。",
-    "ノートにお金がかからない寛大さの十の方法をリストアップしてください。時間、スキル、聴く耳、褒め言葉、忍耐、知識の共有、感謝の手紙、存在感を持ってドアを押さえること、誰かのために料理すること、心の負債を許すこと。三つ選んで今日実践してください。本当の豊かさは持っているもので測るのではなく、自由に与えるもので測ります。",
-    "十分間座ってください。対象に集中するのではなく、思考の間の空間に休んでください。思考が来たら、溶けさせ、次の思考が来る前の隙間に気づいてください。その隙間に休んでください。最初は短いかもしれません——純粋な気づきの半秒。その隙間は無ではありません。すべての基盤です。ノートに体験を描写してください。たとえ何も起きなかったように感じても。何もないことが時に最も深い何かです。",
-    "あなたの十の最も重要な価値観をリストアップしてください。あるべきだと思うものではなく、実際にあなたの選択を動かしているもの。今、先週の時間の使い方を見てください。価値観と時間の間にどれくらいの整合性がありますか？ノートにギャップについて書いてください。価値観と合わない生き方をすると、すべてを持っていても空虚に感じます。整合性が意味のある人生への静かな秘訣です。",
-    "ブッダは、痛みは避けられないが苦しみは選択だと教えました。最初の矢はあなたに起こること。第二の矢はそれについて語る物語です。なぜ私に、いつもこうなる、耐えられない。今日、不快なことが起きたら、最初の矢に気づき、第二の矢を見張ってください。ノートに両方の矢を描写してください。最初の矢を受けて第二の矢を放たずにいられますか？これが不必要な苦しみからの自由への道です。",
-    "目を閉じ、一年後の人生を想像してください。最も深い価値観と完全に合致した人生を。詳細に見てください。どこにいるか、朝がどう展開するか、仕事がどう見えるか、人間関係がどう感じるか、内なる状態はどうか。この想像に十分間費やしてください。ノートに鮮明に描写してください。視覚化は空想ではありません。見えないものを見えるようにする実践です。",
-    "今日、何かに強く反応する瞬間に注意を払ってください——怒り、防御、傷つき。反応に従わず、立ち止まり、好奇心を持って調べてください。体のどこで感じましたか？何がトリガーでしたか？どんな古い傷とつながりますか？ノートにひとつの反応的な瞬間を詳しく描いてください。反応性は無意識の過去が現在を乗っ取ることです。気づきがその連鎖を断ち切ります。",
-    "受容は承認を意味しません。現実と戦争することなく、あるがままを認めることです。今日、抵抗してきた状況をひとつ選んでください。それと共に座り、言ってください。今はこうなのだ。永遠にではない。ただ今。ノートに受容と諦めの違いについて書いてください。抵抗は疲弊させます。受容はエネルギーを解放し、唯一重要な問いに向けます。今、何ができるか？",
-    "感謝、思いやり、忍耐を実践します。しかし喜びを実践することはどれくらいありますか？今日、意図的に三つの喜びの瞬間を作ってください。心を動かす曲を聴く、夕暮れの光の変化を見る、完全な注意を込めて一口を味わう。ノートに各瞬間を描写してください。喜びは軽薄ではありません。観想的伝統では、霊的成熟のしるしとされています——普通のものに感動する能力。",
-    "生計の立て方はスピリチュアルな実践です。今日、仕事について正直に振り返ってください。他者の幸せに貢献していますか？価値観と合致していますか？才能を表現できていますか？ノートに、仕事をもっと合致させるために何を変える必要があるかを書いてください。仕事を辞める必要はありません。正しい生計は時に、肩書きの変更ではなく、意図の変化から始まります。",
-    "すべての親密な関係は鏡であり、そうでなければ見えない自分の部分を映し返します。今日、重要な関係をひとつ選び問いかけてください。この人は私に何を映し返しているか？自分の中に眠っている何を賞賛しているか？自分で受け入れていない何にイライラしているか？ノートにこの鏡を正直に探求してください。最も近い人々が最も強力な——そして最も不快な——師です。",
-    "初心者の心には多くの可能性があります。専門家の心にはほとんどありません。今日、馴染みのある活動ひとつに——歯を磨く、コーヒーを入れる、通勤——まるで初めて体験するかのように向き合ってください。すべてに気づいてください。ノートに発見したことを書いてください。何かを知っていると思うとき、それを見ることをやめます。初心はルーティンの盲目への解毒剤です。",
-    "今日は勇気が必要です。ノートに三つのリストを作ってください。今年誇りに思うこと。避けていること。自分に言っていない真実。容赦なく正直に——このノートはあなただけのものです。書いたものを何も直そうとせずに座ってください。最も変容的なことは、ひるむことなく自分の人生を明確に見ることです。明確さは常に意味のある変化に先立ちます。",
-    "人生のすべてはエネルギーを与えるか奪うかのどちらかです。今日、ノートにあなたにエネルギーを与える人、活動、環境、習慣、約束と、消耗させるものをリストアップしてください。正直に。消耗させるもののひとつを減らすか手放す意志があるものに丸をつけ、エネルギーを与えるもののひとつを増やす意志があるものに丸をつけてください。あなたのエネルギーは有限で神聖です。",
-    "人生には喜びと悲しみの両方が含まれ、しばしば同時に。美しい夕日はいなくなった人を思い出させます。子供の笑い声は苦しみを含む世界に存在します。今日、十分間座り、喜びと悲しみの両方を一度に抱いてください。選ばないでください。両方を抱いてください。ノートに体験を書いてください。矛盾を抱ける心が、本当に目覚めた心です。",
-    "今日の実践は「十分」について。ノートに書いてください。何があれば十分か？その答えを持ったとき、すでにそれをどれだけ持っているか見てください。十分であることは制限ではなく、解放です。常にもっとを追い求めることから自由になること。今日、一瞬一瞬にこう問いかけてください。これは十分か？答えはしばしば、はい。",
-    "今日、自分を完全に表現してください。考えを検閲したり、期待に合わせたりしないでください。会話で本当のことを言ってください。着たいものを着てください。感じていることを感じてください。ノートに、本当の自分を表現した瞬間と、それを抑えた瞬間を書いてください。本当の自己表現は完璧ではありません。正直であることです。",
-    "赦しの儀式の時間です。赦す必要がある人のリストを作ってください——自分を含めて。各人に対して、心の中でこう言ってください。あなたを赦します。私を自由にします。実際に赦しを感じる必要はありません——意図で十分です。ノートに体験を書いてください。赦しは相手への贈り物ではありません。重荷を下ろす自分への贈り物です。",
-    "今日、すべての会話にマインドフルネスを持ち込んでください。話す前に一呼吸。聴くとき完全に存在する。反応ではなく応答する。ノートに今日の三つの会話を書いてください。どこでマインドフルでしたか？どこで自動的でしたか？マインドフルな対話は単なるコミュニケーション技術ではありません。思いやりの実践です。",
-    "今日、知っていることをひとつ教えてください。友人にスキルを教える、同僚に洞察を共有する、子供に何かを説明する。教えることは学びの最も深い形です。ノートに何を教えたか、そしてそのプロセスで何を学んだかを書いてください。知識は共有されるとき成長します。握りしめると萎縮します。",
-    "目を閉じ、人生の終わりを想像してください。怖がらせるためではなく、明確にするために。何を成し遂げたかではなく、人々にどう感じさせたかで覚えられたいですか？ノートに自分の弔辞を書いてください——今のものではなく、望むものを。どんな資質があなたを定義しますか？どんな影響を残しましたか？今日、その人に向かって何ができますか？",
-    "慈悲の瞑想の上級版。今日は完全な範囲に拡げてください。自分、愛する人、友人、中立な人、困難な人、そしてすべての存在にフレーズを贈ってください。各二分間。幸せでありますように。健康でありますように。安全でありますように。安らかに暮らせますように。ノートに心が開いたところと抵抗したところを書いてください。",
-    "ノートにこの質問に答えてください。明日すべての物質的なものを失ったら、何が残りますか？奪えない豊かさについて書いてください。知恵、愛する能力、回復力、人間関係、やり直す力。これらがあなたの本当の資産です。今日、そのひとつに投資してください。愛する人に電話する。何かを学ぶ。感謝の中に座る。本当の豊かさは心の中で複利で増えます。",
-    "今日、完全な孤独の中で三十分を過ごしてください。電話なし、本なし、音楽なし。ただあなただけ。快適な場所に座り、ただ存在してください。正式な瞑想をしないでください。刺激や予定なしにただ存在してください。ノートに何が生じたかを書いてください。多くの人にとって孤独は怖い。自分を避けるために使うすべての気晴らしを剥ぎ取るからです。",
-    "過去八十日間、特定のエクササイズを実践してきました。今日、すべてが実践であることを認識してください。朝食を作ることは実践。運転は実践。意見の相違は実践。夕日は実践。ノートに今日の三つの普通の瞬間を描写し、それぞれが実践として何を提供したかを特定してください。すべてが実践になるとき、スピリチュアルと日常の間に区別はありません。",
-    "仏教の伝統で菩薩とは、自分だけでなくすべての存在のために覚りを求める者です。今日、静かに座り、あなた自身のこの誓いを立ててください。宗教としてではなく、意図として。ノートに書いてください。すべての存在に何を願うか？覚りが他者に仕えるために何を実践するか？自分だけに仕えるスピリチュアルな成長はやがて牢獄になります。すべてに仕える成長が解放になります。",
-    "一日目から今日までのノートを読み返してください。判断なしに。筆跡がどう変わったか、洞察がどう深まったか、テーマがどう進化したかに気づいてください。今日のノートに、この旅を始めた自分について書いてください。その人に何を言いますか？その勇気の何に感謝しますか？あなたは始めた人と同じではありません。あなたがいた人と、なりつつある人の両方を敬ってください。",
-    "静かに座りこう考えてください。あなたは自分自身を創らなかった。体は土壌で育った食物から作られ、雨に養われ、太陽にエネルギーを得た。心はあなたに話したすべての人、読んだすべての本、生き延びたすべての経験によって形作られた。あなたは宇宙全体とこの特定の瞬間の協力作品です。ノートに相互依存が生き方にとって何を意味するか書いてください。",
-    "スピリチュアルな成長のパラドックス。ここまで導いた道は最終的に手放さなければなりません。実践、概念、探求者としてのアイデンティティ——これらは筏であり目的地ではありません。今日、この旅自体にしがみついているかもしれないものを振り返ってください。ノートに探求してください。成長と呼ぶ必要なしに成長し続けられるか？月を指す指は月ではない。",
-    "今日、快適さを少し超えて根本的に寛大であってください。簡単に感じる以上を与えてください——時間、お金、エネルギー、脆弱性を。害になるほどではなく、伸びを感じるほどに。ノートに何を与えたか、それが何を呼び起こしたかを書いてください。寛大さは筋肉です。すべての筋肉と同じく、馴染みの範囲を超えて押すときにのみ成長します。",
-    "あなたの中には、物語、痛み、名前、歴史に触れられたことのない場所があります。それは回転する世界の中心の静寂の点です。今日、十五分間座りそれを探してください。努力ではなく明け渡しで。すべてを落とさせてください——思考、感情、アイデンティティ——そして残るものに休んでください。ノートに見つけたものを書いてください。何もなくても。特に何もなければ。",
-    "九十日間マントラを提供されてきました。今日、あなた自身のものを書いてください。静かに座り自問してください。私の魂が今最も聴く必要があるのは何か？浮かんだものを書き、骨に真実と感じるまで磨いてください。三回声に出して唱えてください。ノートにマントラとなぜこの言葉を選んだかを書いてください。これからはあなたのものです。知恵は常にあった場所から来ました。内なるところから。",
-    "到着しました。九十日間の現れ、不快と共に座ること、難しい質問をすること、自分に思いやりを贈ること。ノートにこの旅について自由に書いてください。何が驚きましたか？何が変わりましたか？何が未解決のままですか？何を持ち続けますか？内なる生活からの卒業はありません——より深い実践があるだけです。今日、認めてください。ほとんどの人が決してしないことをしました。内を見つめ、留まりました。",
-    "九十日目は終わりではありません。始まりです。今日、ノートに人生の次の季節のための実践をデザインしてください。これら九十日間から何を残しますか？どんな新しい実践があなたを呼んでいますか？ガイド付きの構造なしにどう成長し続けますか？補助輪は今日外れます。しかし道は続きます。必要なものはすべて持っています。いつも持っていました。旅はただ思い出す手助けをしただけです。",
-    "今日、あなたを形作った誰かに感謝の手紙を書いてください。まだ送らないでください。何も控えずに完全に書いてください。彼らが知らないかもしれない特定の瞬間、言葉、贈り物に感謝してください。ノートに、表現された感謝がどう生きた遺産になるか振り返ってください。他者が与えてくれたものに名前をつけるとき、贈り手と受け手の両方を祝福する円が完成します。",
-    "今日、完全な意識ですべての金銭的取引を追跡してください。各購入の前に立ち止まり問いかけてください。これは私の価値観を反映しているか？各取引の後、どう感じるか気づいてください。ノートに一日を振り返ってください。お金は結晶化した生命エネルギーです。無意識に使うとき活力が漏れます。意識を持って使うとき、すべての取引が実践になります。",
-    "今日、信頼する人に本当のことを共有してください。夢、恐れ、不完全な真実。承認のためではなく、本当に見てもらう実践として。ノートに体験を書いてください。脆弱性は体でどう感じましたか？本当の自分を見せたとき何が起きましたか？私たちは自分のバージョンをキュレーションするのに多くのエネルギーを費やします。本当の帰属には、ありのままで現れる勇気が必要です。",
-    "構造化された九十日の旅は終わりに近づいていますが、実践は続きます。今日、あなた自身の日常的なスピリチュアルな実践をデザインしてください。最も役に立ったものから選んでください。瞑想、ジャーナリング、感謝、慈悲の瞑想、呼吸法、歩く瞑想、または全く新しいもの。いつ、どこで、どれくらいの時間かを詳しく書いてください。持続できるほどシンプルに保ってください。",
-    "今日、すべての普通の瞬間を聖なるものとして扱ってください。皿を洗うことが瞑想になります。食べることが儀式になります。歩くことが巡礼になります。話すことが祈りになります。スピリチュアルと日常の間に境界線はありません。ノートに今日聖なるものにした三つの普通の瞬間を描写してください。すべてが実践になるとき、どこにも行く必要がなかったと気づきます。",
-    "今日、三つの意図的な優しさの行為をしてください。自分へひとつ、親しい人へひとつ、見知らぬ人へひとつ。各々を具体的で意図的にしてください。自分へは休息、栄養、美しさ。親しい人へは手紙、時間の贈り物、心からの褒め言葉。見知らぬ人へは認識されない寛大さ。ノートに三つすべてについて書いてください。優しさは贅沢ではありません。最も実用的なスピリチュアルな実践です。",
-    "今日、あなたの人生を通して豊かさが流れたすべての方法を振り返ってください。お金だけでなく、愛、機会、学び、美しさ、健康、友情。ノートに豊かさの棚卸しをしてください。少なくとも二十項目。そして問いかけてください。私は水路か、それともダムか？豊かさは自由に動くことを許す人が最も繁栄します。寛大に受け取り、寛大に与える。",
-    "今日は統合のためです。二十分間静かに座り、過去八十七日間を骨に染み込ませてください。要約も分析もしないでください。ただすべてと共に座ってください。そしてノートに自由に書いてください。計画せずに手を動かしてください。テストではありません。達成すべきものはありません。植えられたものが自分の表現を見つけるのを許してください。プロセスを信頼してください。自分を信頼してください。",
-    "今日、親しい友人に向けるのと同じ優しさで自分を見つめてください。あなたはほぼ九十日間、より存在し、より思いやりを持ち、より気づきを深めることを学んできました。ノートに自分への愛の手紙を書いてください——達成したことについてではなく、あなたが誰であるかについて。改善されたバージョンではなく、ずっとそこにいたバージョン。騒音の下に隠れていた存在を。これはセルフラブの終わりではありません。それがいつも始まりだったと気づく瞬間です。",
-    "静かに座り、この旅全体を思い浮かべてください。困難な日々、突破の瞬間、実践したくなかったけれどした日々、驚きと沈黙。すべてを祝福してください。この旅が教えてくれたことに感謝してください。そして優しく解放してください。経験にしがみつく必要はありません。それは今、あなたの一部です。ノートに祝福と解放を書いてください。完成はそれ自体の始まりです。",
-    "九十日目。ほとんどの人が始めない道を歩きました。目をそらす方が簡単だったのに内を見つめました。不快と共に座り、自分に思いやりを贈り、信念を検証し、寛大さを実践し、成長する勇気を持ちました。この旅に卒業はありません——継続だけがあります。道はここで終わりません。開きます。ノートに次の章への意図を書いてください。準備はできています。いつもできていました。",
-  ],
-  m: [
-    "私は、すでに私を取り巻く豊かさに感謝します。",
-    "私は完全にここに、完全に生きて、この瞬間にいます。",
-    "私はありのままの自分を無条件に愛します。",
-    "私はあらゆる形の豊かさに値します。",
-    "私は勇気と優雅さで自分の限界を超えて広がります。",
-    "静寂の中に、探し求めていた答えを見つけます。",
-    "私の体は神聖であり、敬意を持って扱います。",
-    "私は自分の物語の著者であり、愛を込めて書くことを選びます。",
-    "毎朝は、新たに始めるための聖なる招待です。",
-    "自由に与えるとき、豊かさは私に流れ戻ります。",
-    "愛ある境界線を設けることで、自分のニーズを尊重します。",
-    "私が踏む一歩一歩が、存在の祈りです。",
-    "呼吸が内なる平和と私をつなぎます。",
-    "感謝は単なる思考ではありません。在り方です。",
-    "私は万物の本質として変化を受け入れます。",
-    "思いやりを持って自分のすべての部分を受け入れます。",
-    "もはや平和に役立たないものを解放します。",
-    "判断ではなく思いやりを持って感情を観察します。",
-    "私は十分に持っています。私は十分です。この瞬間で十分です。",
-    "困難なものと共に座れるほど、私は強いです。",
-    "私にふさわしい優しさで自分に語りかけます。",
-    "体、心、魂を意図を持って養うことを選びます。",
-    "すべての存在が幸せで、健康で、安全で、平和でありますように。",
-    "私は人生のタイミングを信頼します。",
-    "体が持つ知恵に耳を傾けます。",
-    "回避ではなく好奇心を持って恐れに向き合います。",
-    "人生を開いた手と開いた心で優しく抱きます。",
-    "間の中に、選ぶ力を見つけます。",
-    "困難の中にも、知恵の種を見つけます。",
-    "私はすべての命の織物に織り込まれています。",
-    "出会うすべての人が、私の知らない戦いを闘っています。",
-    "真実、優しさ、意図を持って話します。",
-    "十分な注意は、私が贈れる最大の贈り物です。",
-    "本当に大切なもののための空間を創ります。",
-    "苦しみを抱え、愛に変容させる勇気を持っています。",
-    "通知は私ではありません。その背後にある気づきが私です。",
-    "喜びも困難も、安定した心で迎えます。",
-    "認められるためではなく、与えることが私の本質だから奉仕します。",
-    "この命は有限だから、あらゆる瞬間が貴重です。",
-    "自然は私に忍耐、回復力、明け渡しを教えます。",
-    "優雅さと気づきを持ってバランスの道を歩みます。",
-    "知らなかったことを知らなかった過去の自分を赦します。",
-    "私を制限する信念を解放し、自由にする真実を受け入れます。",
-    "心で聴くとき、私の目的が姿を現します。",
-    "宇宙は寛大であり、私は受け取ることに開かれています。",
-    "私は思考ではありません。それらを観察する気づきです。",
-    "数えられないほど豊かです。",
-    "空の中に、存在の充満を見つけます。",
-    "本当に大切なことと調和して生きます。",
-    "痛みに物語を加えずに感じます。",
-    "最高の人生を明確に見て、毎日それに向かって進みます。",
-    "古い傷からではなく、存在から応答します。",
-    "あるがままを受け入れ、次に来るものを形作る力を信頼します。",
-    "深く、複雑でない喜びを経験する許可を自分に与えます。",
-    "私の仕事は、最も深い価値観の表現です。",
-    "私の人間関係は、学ぶ準備ができたことを教えてくれます。",
-    "新鮮な目と開いた心でそれぞれの瞬間に向き合います。",
-    "自分の人生を明確に見る勇気を持っています。",
-    "エネルギーを守り、賢く投資します。",
-    "喜びと悲しみの両方を安定した心で抱きます。",
-    "十分であることの豊かさに安らぎます。",
-    "本当の自分を表現する自由を自分に許します。",
-    "赦しは、自分を重荷から解放する贈り物です。",
-    "すべての会話に思いやりの気づきを持ち込みます。",
-    "学んだことを分かち合うとき、理解は深まります。",
-    "残したい遺産への貢献として毎日を生きます。",
-    "私の思いやりに境界はありません。",
-    "すべてが剥ぎ取られたとき残るもので、本当の豊かさを測ります。",
-    "自分自身の存在の中で安らいでいます。",
-    "すべての瞬間が気づきを実践する機会です。",
-    "私の成長は私だけでなく、すべての存在に仕えます。",
-    "ここに導いたすべての自分を敬います。",
-    "私は宇宙とこの瞬間の協力作品です。",
-    "道を解放し、開かれた道を信頼します。",
-    "大胆に与え、与えることで豊かさを発見します。",
-    "すべての中心に、平和があります。",
-    "内に生きる知恵を信頼します。",
-    "目覚めています。感謝しています。続けます。",
-    "旅は終わりません。開いた心で歩み続けます。",
-    "私の感謝は、私を形作った人々への贈り物です。",
-    "すべての金銭的選択は、最も深い価値観の表現です。",
-    "本当の自分を見せ、その脆弱性の中につながりを見つけます。",
-    "毎日自分を養う実践をデザインします。",
-    "すべての普通の瞬間が、その中に聖なるものを宿しています。",
-    "私の優しさは波紋のように広がり、平和となって戻ります。",
-    "世界を祝福するために豊かさが流れる寛大な水路です。",
-    "学んだすべてが今、私の中に生きていることを信頼します。",
-    "自分に今与えている愛に、いつも値する存在でした。",
-    "この旅を祝福し、開いた心で解放します。",
-    "私は完全であり、始まったばかりです。",
-  ]
-};
-
-function getDayData(dayNum, user) {
-  var d = DAYS[dayNum - 1] || DAYS[0];
-  var lang = (user && user.lang) || "en";
-  if (lang === "ja" && JA_DAYS && JA_DAYS.t[dayNum - 1]) {
-    return { day: dayNum, category: d.c, title: JA_DAYS.t[dayNum - 1], instruction: JA_DAYS.i[dayNum - 1], mantra: JA_DAYS.m[dayNum - 1] };
-  }
-  return { day: dayNum, category: d.c, title: d.t, instruction: d.i, mantra: d.m };
+function fetchProgramJson(url) {
+  return fetch(url, { credentials: "same-origin", cache: "force-cache" }).then(function(res) {
+    if (!res.ok) throw new Error("Failed to load program content");
+    return res.json();
+  });
 }
 
-var F = "'Cormorant Garamond', serif";
-var B = "'Nunito Sans', sans-serif";
+function buildFallbackDay(dayNum, user) {
+  var safeDay = Math.min(90, Math.max(1, Number(dayNum) || 1));
+  return {
+    day: safeDay,
+    category: CATS[(safeDay - 1) % CATS.length],
+    title: l(user, "Day " + safeDay, "Day " + safeDay),
+    instruction: l(
+      user,
+      "Your Lumina lesson is getting ready. Take three slow breaths and return in a moment.",
+      "Luminaのレッスンを準備中です。ゆっくり3回呼吸して、少し待ってください。"
+    ),
+    mantra: l(user, "I am here, and I am ready.", "私はここにいて、受け取る準備ができています。")
+  };
+}
+
+function normalizeProgramContentEn(raw) {
+  if (!Array.isArray(raw) || !raw.length) throw new Error("English program content is invalid");
+  return raw.slice(0, 90).map(function(item, index) {
+    return {
+      day: index + 1,
+      category: CATS.indexOf(item && item.c) >= 0 ? item.c : CATS[index % CATS.length],
+      title: String((item && item.t) || ("Day " + (index + 1))),
+      instruction: String((item && item.i) || ""),
+      mantra: String((item && item.m) || "")
+    };
+  });
+}
+
+function normalizeProgramContentJa(raw) {
+  if (!raw || !Array.isArray(raw.t) || !Array.isArray(raw.i) || !Array.isArray(raw.m)) {
+    throw new Error("Japanese program content is invalid");
+  }
+  var total = Math.min(raw.t.length, raw.i.length, raw.m.length, 90);
+  if (!total) throw new Error("Japanese program content is empty");
+  var result = [];
+  for (var index = 0; index < total; index++) {
+    var base = (PROGRAM_CONTENT.en && PROGRAM_CONTENT.en[index]) || buildFallbackDay(index + 1);
+    result.push({
+      day: index + 1,
+      category: base.category,
+      title: String(raw.t[index] || base.title),
+      instruction: String(raw.i[index] || base.instruction),
+      mantra: String(raw.m[index] || base.mantra)
+    });
+  }
+  return result;
+}
+
+function loadProgramContent() {
+  if (PROGRAM_CONTENT.en && PROGRAM_CONTENT.ja) {
+    return Promise.resolve(PROGRAM_CONTENT);
+  }
+  if (PROGRAM_CONTENT_PROMISE) return PROGRAM_CONTENT_PROMISE;
+
+  PROGRAM_CONTENT_PROMISE = Promise.all([
+    fetchProgramJson("/content/program-en.json"),
+    fetchProgramJson("/content/program-ja.json")
+  ]).then(function(results) {
+    PROGRAM_CONTENT.en = normalizeProgramContentEn(results[0]);
+    PROGRAM_CONTENT.ja = normalizeProgramContentJa(results[1]);
+    return PROGRAM_CONTENT;
+  }).catch(function(error) {
+    PROGRAM_CONTENT_PROMISE = null;
+    throw error;
+  });
+
+  return PROGRAM_CONTENT_PROMISE;
+}
+
+function getDayData(dayNum, user) {
+  var safeDay = Math.min(90, Math.max(1, Number(dayNum) || 1));
+  var lang = (user && user.lang) || "en";
+  var content = lang === "ja" ? PROGRAM_CONTENT.ja : PROGRAM_CONTENT.en;
+  if (content && content[safeDay - 1]) return content[safeDay - 1];
+  return buildFallbackDay(safeDay, user);
+}
+
+var F = '"Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif';
+var B = '"Avenir Next", "Segoe UI", "Helvetica Neue", Arial, sans-serif';
+var MUTED = "#6b5e50";
+var SOFT = "#74695d";
 var CSS = "@keyframes fadeIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}@keyframes breathe{0%,100%{transform:scale(1);box-shadow:0 0 0 0 rgba(196,181,224,0.4)}50%{transform:scale(1.05);box-shadow:0 0 0 14px rgba(196,181,224,0)}}*{box-sizing:border-box;margin:0;padding:0}input:focus,textarea:focus{outline:none;border-color:#c4b5e0!important}::-webkit-scrollbar{width:4px}::-webkit-scrollbar-thumb{background:#d4c5a0;border-radius:2px}";
 
 var COOLDOWN_MS = 12 * 3600000;
@@ -930,6 +374,234 @@ function getLastCompletionTime(progress) {
     }
   });
   return latest || null;
+}
+
+function formatTimeRemaining(ms) {
+  var h = Math.floor(ms / 3600000);
+  var m = Math.ceil((ms % 3600000) / 60000);
+  if (h > 0) return h + "h " + m + "m";
+  return m + " minutes";
+}
+
+var CHECKIN_STATES = [
+  { id: "ground", en: "Grounded", ja: "落ち着いている", color: "#6aaa6e" },
+  { id: "tender", en: "Tender", ja: "繊細", color: "#d4727e" },
+  { id: "heavy", en: "Heavy", ja: "重たい", color: "#7c9ec4" },
+  { id: "open", en: "Open", ja: "開いている", color: "#c9a84c" },
+  { id: "stretched", en: "Stretched", ja: "張りつめている", color: "#9b7fd4" }
+];
+
+function getCheckinStateMeta(stateId) {
+  var fallback = CHECKIN_STATES[0];
+  for (var i = 0; i < CHECKIN_STATES.length; i++) {
+    if (CHECKIN_STATES[i].id === stateId) return CHECKIN_STATES[i];
+  }
+  return fallback;
+}
+
+function getSortedDayNumbers(map) {
+  return Object.keys(map || {}).map(function(k) { return Number(k); }).filter(function(n) { return !isNaN(n); }).sort(function(a, b) { return a - b; });
+}
+
+function getCompletedCount(progress) {
+  return getSortedDayNumbers(progress).filter(function(dayNum) { return !!progress[dayNum]; }).length;
+}
+
+function getGapDays(user, progress) {
+  var highestCompleted = 0;
+  getSortedDayNumbers(progress).forEach(function(dayNum) {
+    if (progress[dayNum]) highestCompleted = Math.max(highestCompleted, dayNum);
+  });
+  var dayFromStart = Math.min(getDaysSinceStart(user && user.startDate), 90);
+  return Math.max(0, dayFromStart - (highestCompleted + 1));
+}
+
+function getReentryPlan(user, progress, dayData) {
+  var gapDays = getGapDays(user, progress);
+  if (gapDays < 3) return null;
+  return {
+    gapDays: gapDays,
+    title: l(user, "Return softly", "やさしく戻る"),
+    body: l(
+      user,
+      "You have been carrying life outside the app too. Come back by completing only one small step today: your check-in, one paragraph of reflection, and one slow breath with the mantra.",
+      "アプリの外でも、あなたは人生を生き続けていました。今日は無理に追いつかず、チェックインと短いリフレクション、そしてマントラと一呼吸だけで戻ってきてください。"
+    ),
+    cue: l(
+      user,
+      "Today's doorway is " + (dayData ? dayData.title : "this day") + ". You do not need to earn your place back here.",
+      "今日の入口は「" + (dayData ? dayData.title : "この日") + "」。ここに戻るために、何かを証明する必要はありません。"
+    )
+  };
+}
+
+function extractKeywords(text) {
+  var stop = { the: 1, and: 1, that: 1, with: 1, from: 1, this: 1, have: 1, your: 1, will: 1, into: 1, about: 1, them: 1, they: 1, what: 1, where: 1, when: 1, feel: 1, felt: 1, been: 1, just: 1, today: 1, because: 1, after: 1, before: 1, there: 1, their: 1, still: 1, more: 1, than: 1, then: 1, over: 1, very: 1, much: 1 };
+  var counts = {};
+  String(text || "").toLowerCase().replace(/[^a-z\s]/g, " ").split(/\s+/).forEach(function(word) {
+    if (!word || word.length < 4 || stop[word]) return;
+    counts[word] = (counts[word] || 0) + 1;
+  });
+  return Object.keys(counts).sort(function(a, b) { return counts[b] - counts[a]; }).slice(0, 3);
+}
+
+function getAdaptiveSupport(user, dayData, checkin, reentryPlan) {
+  var stateMeta = getCheckinStateMeta(checkin && checkin.state);
+  var energy = (checkin && checkin.energy) || 3;
+  var intensity = energy <= 2 ? l(user, "keep it gentle", "やさしく進める") : energy >= 4 ? l(user, "use the extra energy intentionally", "このエネルギーを丁寧に使う") : l(user, "stay steady", "安定して進める");
+  var categoryCopy = {
+    spiritual: l(user, "Let the practice be spacious, not perfect.", "完璧さではなく、余白を大切に。"),
+    "self-love": l(user, "Answer yourself with softness before insight.", "気づきの前に、まず優しさで自分に応える。"),
+    financial: l(user, "Notice what safety means for you today.", "今日の自分にとっての安心を見つめる。"),
+    growth: l(user, "Take the smallest brave step, not the dramatic one.", "劇的な一歩ではなく、いちばん小さな勇気を選ぶ。")
+  };
+  return {
+    eyebrow: l(user, "Adaptive guidance", "今日の寄り添い"),
+    title: l(user, stateMeta.en + " is enough for today.", "今日は「" + stateMeta.ja + "」で大丈夫。"),
+    body: reentryPlan ? reentryPlan.body : categoryCopy[dayData.category],
+    focus: l(user, "Focus: " + intensity, "焦点: " + intensity),
+    prompt: (checkin && checkin.intention)
+      ? l(user, "Return to your intention: " + checkin.intention, "意図に戻る: " + checkin.intention)
+      : l(user, "Choose one intention before you complete the day.", "完了する前に、ひとつ意図を選びましょう。"),
+    color: stateMeta.color
+  };
+}
+
+function pickResurfacedReflection(dayNum, reflections, user) {
+  var reflectionDays = getSortedDayNumbers(reflections).filter(function(savedDay) {
+    return savedDay < dayNum && reflections[savedDay] && reflections[savedDay].body;
+  });
+  if (!reflectionDays.length) return null;
+
+  var favoriteDay = reflectionDays.filter(function(savedDay) { return reflections[savedDay].favorite; }).slice(-1)[0];
+  var mirroredDay = [dayNum - 7, dayNum - 14, dayNum - 21].find(function(candidate) {
+    return candidate > 0 && reflections[candidate] && reflections[candidate].body;
+  });
+  var targetDay = mirroredDay || favoriteDay || reflectionDays[reflectionDays.length - 1];
+  var data = reflections[targetDay];
+  return {
+    day: targetDay,
+    title: getDayData(targetDay, user).title,
+    excerpt: data.body.length > 220 ? data.body.slice(0, 220).trim() + "..." : data.body,
+    favorite: !!data.favorite
+  };
+}
+
+function getWeeklySynthesis(user, progress, checkins, reflections) {
+  var completedDays = getSortedDayNumbers(progress);
+  if (completedDays.length < 3) return null;
+
+  var highestCompleted = completedDays[completedDays.length - 1];
+  var weekIndex = Math.max(1, Math.ceil(highestCompleted / 7));
+  var weekStart = ((weekIndex - 1) * 7) + 1;
+  var weekEnd = Math.min(weekStart + 6, 90);
+  var states = {};
+  var categories = {};
+  var keywords = {};
+  var favoriteCount = 0;
+  var witnessed = 0;
+
+  for (var dayNum = weekStart; dayNum <= weekEnd; dayNum++) {
+    if (progress[dayNum]) witnessed++;
+    if (checkins[dayNum] && checkins[dayNum].state) {
+      states[checkins[dayNum].state] = (states[checkins[dayNum].state] || 0) + 1;
+    }
+    var dayData = getDayData(dayNum, user);
+    categories[dayData.category] = (categories[dayData.category] || 0) + (progress[dayNum] ? 1 : 0);
+    if (reflections[dayNum] && reflections[dayNum].body) {
+      if (reflections[dayNum].favorite) favoriteCount++;
+      extractKeywords(reflections[dayNum].body).forEach(function(word) {
+        keywords[word] = (keywords[word] || 0) + 1;
+      });
+    }
+  }
+
+  var topState = Object.keys(states).sort(function(a, b) { return states[b] - states[a]; })[0] || "ground";
+  var topCategory = Object.keys(categories).sort(function(a, b) { return categories[b] - categories[a]; })[0] || "spiritual";
+  var topKeywords = Object.keys(keywords).sort(function(a, b) { return keywords[b] - keywords[a]; }).slice(0, 3);
+  var stateMeta = getCheckinStateMeta(topState);
+
+  return {
+    weekIndex: weekIndex,
+    title: l(user, "Week " + weekIndex + " synthesis", "第" + weekIndex + "週の統合"),
+    summary: l(
+      user,
+      "This week carried a " + stateMeta.en.toLowerCase() + " tone, with your strongest movement in " + CAT_INFO[topCategory].label.toLowerCase() + ".",
+      "今週は「" + stateMeta.ja + "」のトーンが流れ、もっとも深く動いたテーマは「" + CAT_INFO[topCategory].labelJa + "」でした。"
+    ),
+    focus: favoriteCount > 0
+      ? l(user, "You saved " + favoriteCount + " insight" + (favoriteCount === 1 ? "" : "s") + " worth returning to.", "戻る価値のある気づきを " + favoriteCount + " 件残しました。")
+      : l(user, "No favorite insight saved yet. Mark one line that you want to keep.", "まだお気に入りの気づきはありません。残したい一文をひとつ選びましょう。"),
+    witnessed: witnessed,
+    keywords: topKeywords,
+    color: stateMeta.color
+  };
+}
+
+function getJourneyMetrics(progress, checkins, reflections) {
+  var completedDays = getSortedDayNumbers(progress);
+  var favoriteCount = getSortedDayNumbers(reflections).filter(function(dayNum) {
+    return reflections[dayNum] && reflections[dayNum].favorite;
+  }).length;
+  var returns = 0;
+  var lastTs = null;
+
+  completedDays.forEach(function(dayNum) {
+    var ts = progress[dayNum] && progress[dayNum].completedAt ? new Date(progress[dayNum].completedAt).getTime() : null;
+    if (ts && lastTs && (ts - lastTs) > (36 * 3600000)) returns++;
+    if (ts) lastTs = ts;
+  });
+
+  return {
+    completedCount: completedDays.length,
+    checkinCount: getSortedDayNumbers(checkins).length,
+    favoriteCount: favoriteCount,
+    returnCount: returns
+  };
+}
+
+function getMilestoneData(count, user) {
+  var milestones = {
+    7: {
+      title: l(user, "First week complete", "最初の1週間を完了"),
+      body: l(user, "You have created rhythm. That matters more than speed.", "ペースより大切な、リズムが生まれました。")
+    },
+    15: {
+      title: l(user, "Phase one complete", "フェーズ1を完了"),
+      body: l(user, "The roots are deeper now. Let yourself notice what already feels different.", "根はもう深くなっています。すでに変わっているものに気づいてください。")
+    },
+    30: {
+      title: l(user, "A full month witnessed", "1か月の歩みを見届けた"),
+      body: l(user, "Consistency has become evidence. You are building trust with yourself.", "継続は証拠になりました。あなたは自分との信頼を築いています。")
+    },
+    45: {
+      title: l(user, "Halfway through", "半分まで到達"),
+      body: l(user, "You are no longer just beginning. The work is living in you now.", "もう始めたばかりではありません。実践はすでにあなたの中で生きています。")
+    },
+    60: {
+      title: l(user, "Transformation is visible", "変容が見えてきた"),
+      body: l(user, "The path is asking for integration, not perfection.", "いま必要なのは完璧さではなく、統合です。")
+    },
+    75: {
+      title: l(user, "Wisdom is taking shape", "知恵が形になってきた"),
+      body: l(user, "What used to feel like effort is starting to feel like identity.", "努力だったものが、少しずつ在り方になっています。")
+    },
+    90: {
+      title: l(user, "Journey complete", "旅を完了"),
+      body: l(user, "Completion is not the end. It is proof that you know how to return.", "完了は終わりではなく、戻る力を知った証です。")
+    }
+  };
+  return milestones[count] || null;
+}
+
+function buildLuminaCheckoutUrl(user, planCode) {
+  var params = new URLSearchParams();
+  params.set("plan", planCode || "lumina-monthly");
+  params.set("return_url", window.location.origin + "/?billing=success");
+  if (user && user.email) params.set("email", user.email);
+  if (user && user.name) params.set("name", user.name);
+  if (user && user.lang) params.set("lang", user.lang);
+  return "https://namibarden.com/lumina?" + params.toString();
 }
 
 function playPlaceholderAudio() {
@@ -967,7 +639,7 @@ function DayIllustration(props) {
   var bg = color + "18";
   var fill = color + "35";
   var dayNum = props.dayNum;
-  var illusType = (DAY_ILLUS && DAY_ILLUS[dayNum - 1] !== undefined) ? DAY_ILLUS[dayNum - 1] : dayNum % 20;
+  var illusType = (typeof DAY_ILLUS !== "undefined" && DAY_ILLUS[dayNum - 1] !== undefined) ? DAY_ILLUS[dayNum - 1] : dayNum % 20;
   var el;
 
   if(illusType===0) { // Seed/Sprout
@@ -1029,6 +701,9 @@ function AuthScreen(props) {
   var [lang, setLang] = useState("en");
   var [err, setErr] = useState("");
   var [busy, setBusy] = useState(false);
+  useEffect(function() {
+    trackEvent("auth_screen_viewed", { mode: mode, lang: lang });
+  }, []);
   var submit = async function() {
     setErr("");
     if (!email || !pw) { setErr(t({lang:lang}, "fillAll")); return; }
@@ -1037,10 +712,12 @@ function AuthScreen(props) {
     try {
       if (mode === "signup") {
         var ud = await api.signup(email, name, pw, lang);
-        props.onLogin(ud);
+        trackEvent("auth_signup_completed", { lang: lang }, { email: ud.email });
+        props.onLogin(ud, { mode: mode, lang: lang });
       } else {
         var ud2 = await api.login(email, pw);
-        props.onLogin(ud2);
+        trackEvent("auth_login_completed", { lang: ud2.lang || lang }, { email: ud2.email });
+        props.onLogin(ud2, { mode: mode, lang: ud2.lang || lang });
       }
     } catch(e) {
       var errKey = e.message;
@@ -1052,15 +729,18 @@ function AuthScreen(props) {
   var inp = { width: "100%", padding: "14px 16px", borderRadius: 12, border: "1px solid #e0d8ce", fontFamily: B, fontSize: 15, background: "#fff", marginBottom: 14, color: "#3a3028" };
   var L = {lang: lang};
   return (
-    <div style={{ height: "100vh", background: "#f5f0e8", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24 }}>
+    <main aria-labelledby="lumina-auth-title" aria-describedby="lumina-auth-copy" style={{ minHeight: "100dvh", background: "#f5f0e8", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24 }}>
       <style>{CSS}</style>
       <Logo size={80} />
-      <h1 style={{ fontFamily: F, fontWeight: 300, fontSize: 34, color: "#4a3f33", letterSpacing: 8, margin: "10px 0 2px" }}>LUMINA</h1>
-      <p style={{ fontFamily: B, fontSize: 12, color: "#8a7e6e", letterSpacing: 2, marginBottom: 28 }}>{t(L, "subtitle")}</p>
+      <h1 id="lumina-auth-title" style={{ fontFamily: F, fontWeight: 300, fontSize: 34, color: "#4a3f33", letterSpacing: 8, margin: "10px 0 2px" }}>LUMINA</h1>
+      <p style={{ fontFamily: B, fontSize: 12, color: MUTED, letterSpacing: 2, marginBottom: 10 }}>{t(L, "subtitle")}</p>
+      <p id="lumina-auth-copy" style={{ fontFamily: B, fontSize: 13, color: "#5a4e40", lineHeight: 1.7, textAlign: "center", maxWidth: 380, marginBottom: 28 }}>
+        {l(L, "Daily guidance, reflection, and gentle pacing for meaningful inner work.", "毎日のガイダンス、リフレクション、やさしいペースで深い内面の歩みを支えます。")}
+      </p>
       <div style={{ background: "#fff", borderRadius: 20, padding: "28px 24px", width: "100%", maxWidth: 380, boxShadow: "0 4px 24px rgba(0,0,0,0.06)" }}>
         <div style={{ display: "flex", marginBottom: 20, borderRadius: 10, overflow: "hidden", border: "1px solid #e0d8ce" }}>
           {["login", "signup"].map(function(m) {
-            return <button key={m} onClick={function() { setMode(m); setErr(""); }} style={{ flex: 1, padding: "10px 0", border: "none", cursor: "pointer", fontFamily: B, fontSize: 13, fontWeight: 700, letterSpacing: 1, background: mode === m ? "#4a3f33" : "#fff", color: mode === m ? "#fff" : "#8a7e6e" }}>{m === "login" ? t(L, "signIn") : t(L, "signUp")}</button>;
+            return <button type="button" key={m} aria-pressed={mode === m} onClick={function() { setMode(m); setErr(""); }} style={{ flex: 1, padding: "10px 0", border: "none", cursor: "pointer", fontFamily: B, fontSize: 13, fontWeight: 700, letterSpacing: 1, background: mode === m ? "#4a3f33" : "#fff", color: mode === m ? "#fff" : MUTED }}>{m === "login" ? t(L, "signIn") : t(L, "signUp")}</button>;
           })}
         </div>
         {mode === "signup" && <input placeholder={t(L, "yourName")} value={name} onChange={function(e) { setName(e.target.value); }} style={inp} />}
@@ -1068,25 +748,136 @@ function AuthScreen(props) {
           <div style={{ display: "flex", marginBottom: 14, borderRadius: 10, overflow: "hidden", border: "1px solid #e0d8ce" }}>
             {[["en", "English"], ["ja", "\u65E5\u672C\u8A9E"]].map(function(pair) {
               var code = pair[0], lbl = pair[1];
-              return <button key={code} onClick={function() { setLang(code); }} style={{ flex: 1, padding: "9px 0", border: "none", cursor: "pointer", fontFamily: B, fontSize: 13, fontWeight: 600, background: lang === code ? "#4a3f33" : "#fff", color: lang === code ? "#fff" : "#8a7e6e" }}>{lbl}</button>;
+              return <button type="button" key={code} aria-pressed={lang === code} onClick={function() { setLang(code); }} style={{ flex: 1, padding: "9px 0", border: "none", cursor: "pointer", fontFamily: B, fontSize: 13, fontWeight: 600, background: lang === code ? "#4a3f33" : "#fff", color: lang === code ? "#fff" : MUTED }}>{lbl}</button>;
             })}
           </div>
         )}
         <input placeholder={t(L, "email")} type="email" value={email} onChange={function(e) { setEmail(e.target.value); }} style={inp} />
         <div style={{ position: "relative", marginBottom: 14 }}>
           <input placeholder={t(L, "password")} type={showPw ? "text" : "password"} value={pw} onChange={function(e) { setPw(e.target.value); }} onKeyDown={function(e) { if (e.key === "Enter") submit(); }} style={{ width: "100%", padding: "14px 46px 14px 16px", borderRadius: 12, border: "1px solid #e0d8ce", fontFamily: B, fontSize: 15, background: "#fff", color: "#3a3028", boxSizing: "border-box" }} />
-          <button onClick={function() { setShowPw(!showPw); }} type="button" style={{ position: "absolute", right: 12, top: "50%", transform: "translateY(-50%)", background: "none", border: "none", cursor: "pointer", padding: 4 }}>
+          <button aria-label={showPw ? l(L, "Hide password", "パスワードを隠す") : l(L, "Show password", "パスワードを表示")} title={showPw ? l(L, "Hide password", "パスワードを隠す") : l(L, "Show password", "パスワードを表示")} onClick={function() { setShowPw(!showPw); }} type="button" style={{ position: "absolute", right: 12, top: "50%", transform: "translateY(-50%)", background: "none", border: "none", cursor: "pointer", padding: 4 }}>
             {showPw ? (
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#8a7e6e" strokeWidth="1.5"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+              <svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke={MUTED} strokeWidth="1.5"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
             ) : (
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#8a7e6e" strokeWidth="1.5"><path d="M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19m-6.72-1.07a3 3 0 11-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+              <svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke={MUTED} strokeWidth="1.5"><path d="M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19m-6.72-1.07a3 3 0 11-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
             )}
           </button>
         </div>
         {err && <p style={{ fontFamily: B, fontSize: 13, color: "#c0524a", marginBottom: 8 }}>{err}</p>}
         <button onClick={submit} disabled={busy} style={{ width: "100%", padding: "14px 0", borderRadius: 12, border: "none", background: "#4a3f33", color: "#fff", fontFamily: F, fontSize: 16, fontWeight: 500, letterSpacing: 2, cursor: "pointer", marginTop: 4 }}>{busy ? "..." : t(L, "startJourney")}</button>
       </div>
-    </div>
+    </main>
+  );
+}
+
+function BillingScreen(props) {
+  var user = props.user;
+  var billing = props.billing || {};
+  var entitlement = billing.entitlement || {};
+  useEffect(function() {
+    if (!user || !user.email) return;
+    trackEvent("billing_screen_viewed", {
+      status: entitlement.status || "inactive",
+      accessState: entitlement.accessState || "inactive",
+      justActivated: !!props.justActivated,
+      activatingAccess: !!props.activatingAccess
+    }, { email: user.email });
+  }, [user && user.email, entitlement.status, entitlement.accessState, props.justActivated, props.activatingAccess]);
+  var statusCopy = entitlement.status
+    ? l(user, "Current state: " + entitlement.status, "現在の状態: " + entitlement.status)
+    : l(user, "Membership required to enter Lumina.", "Lumina を使うにはメンバーシップが必要です。");
+  var card = function(planCode, priceEn, priceJa, subtitleEn, subtitleJa) {
+    return (
+      <button
+        key={planCode}
+        onClick={function() { props.onCheckout(planCode); }}
+        style={{
+          width: "100%",
+          border: "1px solid #e4dccf",
+          background: "#fff",
+          borderRadius: 18,
+          padding: "18px 18px",
+          textAlign: "left",
+          cursor: "pointer",
+          boxShadow: "0 2px 10px rgba(0,0,0,0.04)"
+        }}
+      >
+        <p style={{ fontFamily: B, fontSize: 11, fontWeight: 700, letterSpacing: 2, color: "#8a7e6e", textTransform: "uppercase", marginBottom: 8 }}>
+          {planCode === "lumina-monthly" ? l(user, "Monthly membership", "月額メンバーシップ") : l(user, "Annual membership", "年額メンバーシップ")}
+        </p>
+        <h3 style={{ fontFamily: F, fontSize: 28, fontWeight: 400, color: "#3a3028", marginBottom: 6 }}>{l(user, priceEn, priceJa)}</h3>
+        <p style={{ fontFamily: B, fontSize: 13, color: "#5a4e40", lineHeight: 1.6 }}>{l(user, subtitleEn, subtitleJa)}</p>
+      </button>
+    );
+  };
+
+  return (
+    <main aria-labelledby="lumina-billing-title" style={{ minHeight: "100dvh", background: "#f5f0e8", padding: "32px 22px", display: "flex", alignItems: "center", justifyContent: "center" }}>
+      <style>{CSS}</style>
+      <div style={{ width: "100%", maxWidth: 460 }}>
+        <div style={{ textAlign: "center", marginBottom: 24 }}>
+          <Logo size={76} />
+          <h1 id="lumina-billing-title" style={{ fontFamily: F, fontWeight: 400, fontSize: 34, color: "#4a3f33", letterSpacing: 8, margin: "10px 0 6px" }}>LUMINA</h1>
+          <p style={{ fontFamily: B, fontSize: 13, color: MUTED, lineHeight: 1.7 }}>
+            {l(
+              user,
+              "Billing is managed on namibarden.com. Use the same email address here and on checkout so your access unlocks automatically.",
+              "請求は namibarden.com 側で管理されます。ここで使うメールアドレスと同じものを決済でも使うと、自動でアクセスが有効になります。"
+            )}
+          </p>
+        </div>
+
+        <div style={{ background: "#fff", borderRadius: 22, padding: "24px 22px", boxShadow: "0 8px 28px rgba(0,0,0,0.06)" }}>
+          <div style={{ marginBottom: 18, padding: "14px 16px", borderRadius: 16, background: "linear-gradient(135deg, #f8f3eb, #fff)", border: "1px solid #eadfcf" }}>
+            <p style={{ fontFamily: B, fontSize: 12, fontWeight: 700, color: "#6b5e50", marginBottom: 4 }}>{user.name}</p>
+            <p style={{ fontFamily: B, fontSize: 12, color: "#8a7e6e", marginBottom: 6 }}>{user.email}</p>
+            <p style={{ fontFamily: B, fontSize: 13, color: "#5a4e40", lineHeight: 1.6 }}>{statusCopy}</p>
+          </div>
+
+          {props.activatingAccess && (
+            <div style={{ marginBottom: 18, padding: "14px 16px", borderRadius: 16, background: "#f7f0ff", border: "1px solid #ddd0f2" }}>
+              <p style={{ fontFamily: B, fontSize: 13, color: "#6a55a3", lineHeight: 1.6 }}>
+                {l(user, "Activating your Lumina access now. This can take a few moments after checkout.", "Lumina のアクセスを有効化しています。決済直後は少しだけ時間がかかることがあります。")}
+              </p>
+            </div>
+          )}
+
+          {props.justActivated && (
+            <div style={{ marginBottom: 18, padding: "14px 16px", borderRadius: 16, background: "#eaf5eb", border: "1px solid #cfe4d1" }}>
+              <p style={{ fontFamily: B, fontSize: 13, color: "#3f7d46", lineHeight: 1.6 }}>
+                {l(user, "Checkout completed. Refresh access if Lumina has not unlocked yet.", "決済は完了しています。まだ Lumina が開かない場合はアクセスを更新してください。")}
+              </p>
+            </div>
+          )}
+
+          <div style={{ display: "grid", gap: 12, marginBottom: 16 }}>
+            {card(
+              "lumina-monthly",
+              "JPY 2,980 / month",
+              "2,980円 / 月",
+              "7-day trial, full guided journey, weekly synthesis, reflection library, and ongoing access.",
+              "7日間トライアル、ガイド付きジャーニー、週次統合、リフレクション保存、継続アクセス。"
+            )}
+            {card(
+              "lumina-annual",
+              "JPY 29,800 / year",
+              "29,800円 / 年",
+              "Best value for deeper work across the full year.",
+              "一年を通して深く取り組む方向けのプランです。"
+            )}
+          </div>
+
+          <div style={{ display: "flex", gap: 10 }}>
+            <button onClick={props.onRefresh} style={{ flex: 1, padding: "12px 0", borderRadius: 12, border: "1px solid #d9d0c4", background: "#fff", color: "#6b5e50", fontFamily: B, fontSize: 13, cursor: "pointer" }}>
+              {l(user, "Refresh access", "アクセスを更新")}
+            </button>
+            <button onClick={props.onOpenPortal} style={{ flex: 1, padding: "12px 0", borderRadius: 12, border: "none", background: "#4a3f33", color: "#fff", fontFamily: B, fontSize: 13, cursor: "pointer" }}>
+              {l(user, "Manage billing", "請求を管理")}
+            </button>
+          </div>
+        </div>
+      </div>
+    </main>
   );
 }
 
@@ -1143,6 +934,28 @@ function JourneyMap(props) {
       </svg>
 
       <div style={{ position: "relative", zIndex: 1, padding: "8px 14px 20px" }}>
+        {props.reentryPlan && (
+          <div style={{ background: "linear-gradient(135deg, #fff6ea, #fff)", borderRadius: 18, padding: "16px 18px", marginBottom: 10, border: "1px solid #ead7b8", boxShadow: "0 2px 12px rgba(0,0,0,0.04)" }}>
+            <p style={{ fontFamily: B, fontSize: 11, fontWeight: 700, letterSpacing: 2, color: "#b07a30", textTransform: "uppercase", marginBottom: 6 }}>{props.reentryPlan.title}</p>
+            <p style={{ fontFamily: F, fontSize: 19, color: "#3a3028", marginBottom: 8 }}>{l(user, props.reentryPlan.gapDays + " days away does not erase the path.", props.reentryPlan.gapDays + "日空いても、この道は消えません。")}</p>
+            <p style={{ fontFamily: B, fontSize: 13, color: "#6b5e50", lineHeight: 1.7, marginBottom: 8 }}>{props.reentryPlan.body}</p>
+            <p style={{ fontFamily: B, fontSize: 12, color: "#8a7e6e", lineHeight: 1.6 }}>{props.reentryPlan.cue}</p>
+          </div>
+        )}
+        {props.weeklySynthesis && (
+          <div style={{ background: "linear-gradient(135deg, " + props.weeklySynthesis.color + "14, #fff)", borderRadius: 18, padding: "16px 18px", marginBottom: 10, border: "1px solid " + props.weeklySynthesis.color + "25", boxShadow: "0 2px 12px rgba(0,0,0,0.04)" }}>
+            <p style={{ fontFamily: B, fontSize: 11, fontWeight: 700, letterSpacing: 2, color: props.weeklySynthesis.color, textTransform: "uppercase", marginBottom: 6 }}>{props.weeklySynthesis.title}</p>
+            <p style={{ fontFamily: B, fontSize: 13, color: "#5a4e40", lineHeight: 1.7, marginBottom: 8 }}>{props.weeklySynthesis.summary}</p>
+            <p style={{ fontFamily: F, fontSize: 18, color: "#3a3028", marginBottom: 8 }}>{props.weeklySynthesis.focus}</p>
+            {props.weeklySynthesis.keywords && props.weeklySynthesis.keywords.length > 0 && (
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                {props.weeklySynthesis.keywords.map(function(keyword) {
+                  return <span key={keyword} style={{ padding: "5px 10px", borderRadius: 999, background: "#fff", border: "1px solid #eadfcf", fontFamily: B, fontSize: 11, color: "#7a6b5c" }}>{keyword}</span>;
+                })}
+              </div>
+            )}
+          </div>
+        )}
         {completedCount > 0 && (
           <div style={{ display: "flex", justifyContent: "center", marginBottom: 8 }}>
             <div style={{ background: "linear-gradient(135deg, #e6f2e7, #eaf5eb)", borderRadius: 20, padding: "6px 18px", boxShadow: "0 2px 8px rgba(106,170,110,0.15)" }}>
@@ -1302,26 +1115,20 @@ function LessonImage(props) {
   var cat = props.cat;
   var [imgData, setImgData] = useState(null);
   var [loadingImg, setLoadingImg] = useState(true);
-  var [imgError, setImgError] = useState(false);
   useEffect(function() {
     setLoadingImg(true);
     setImgData(null);
-    setImgError(false);
-    var cancelled = false;
     var load = async function() {
       try {
         var data = await api.getImage(dayNum);
-        if (!cancelled && data) setImgData(data);
-      } catch(e) {
-        // Silently fall back to watercolor art
-      }
-      if (!cancelled) setLoadingImg(false);
+        if (data) setImgData(data);
+      } catch(e) {}
+      setLoadingImg(false);
     };
     load();
-    return function() { cancelled = true; };
   }, [dayNum]);
   if (loadingImg) return <div style={{ height: 160, borderRadius: 14, background: cat.bg, display: "flex", alignItems: "center", justifyContent: "center" }}><p style={{ fontFamily: B, fontSize: 12, color: "#a09488" }}>Loading...</p></div>;
-  if (imgData && !imgError) return <img src={imgData} alt={"Day " + dayNum} onError={function() { setImgError(true); }} style={{ width: "100%", borderRadius: 14, display: "block", objectFit: "cover", maxHeight: 220 }} />;
+  if (imgData) return <img src={imgData} alt={"Day " + dayNum} style={{ width: "100%", borderRadius: 14, display: "block", objectFit: "cover", maxHeight: 220 }} />;
   return <WatercolorArt dayNum={dayNum} cat={cat} />;
 }
 
@@ -1333,52 +1140,52 @@ function LessonView(props) {
   var [playing, setPlaying] = useState(false);
   var [showCooldown, setShowCooldown] = useState(false);
   var [audioUrl, setAudioUrl] = useState(null);
-  var [audioError, setAudioError] = useState(null);
-  var [uploadError, setUploadError] = useState(null);
+  var [checkinState, setCheckinState] = useState((props.checkin && props.checkin.state) || "ground");
+  var [energy, setEnergy] = useState((props.checkin && props.checkin.energy) || 3);
+  var [intention, setIntention] = useState((props.checkin && props.checkin.intention) || "");
+  var [note, setNote] = useState((props.checkin && props.checkin.note) || "");
+  var [reflectionBody, setReflectionBody] = useState((props.reflection && props.reflection.body) || "");
+  var [favoriteReflection, setFavoriteReflection] = useState(!!(props.reflection && props.reflection.favorite));
+  var [savingCheckin, setSavingCheckin] = useState(false);
+  var [savingReflection, setSavingReflection] = useState(false);
+  var [savedCheckin, setSavedCheckin] = useState(false);
+  var [savedReflection, setSavedReflection] = useState(false);
   var audioRef = useRef(null);
+
+  useEffect(function() {
+    setCheckinState((props.checkin && props.checkin.state) || "ground");
+    setEnergy((props.checkin && props.checkin.energy) || 3);
+    setIntention((props.checkin && props.checkin.intention) || "");
+    setNote((props.checkin && props.checkin.note) || "");
+    setSavedCheckin(false);
+  }, [dayNum, props.checkin && props.checkin.updatedAt]);
+
+  useEffect(function() {
+    setReflectionBody((props.reflection && props.reflection.body) || "");
+    setFavoriteReflection(!!(props.reflection && props.reflection.favorite));
+    setSavedReflection(false);
+  }, [dayNum, props.reflection && props.reflection.updatedAt]);
 
   // Load stored mp3 for this day
   useEffect(function() {
     setAudioUrl(null);
-    setAudioError(null);
-    setUploadError(null);
-    var cancelled = false;
     var loadAudio = async function() {
       try {
         var data = await api.getAudio(dayNum);
-        if (!cancelled && data) setAudioUrl(data);
-      } catch(e) {
-        // Silently fall back to placeholder audio
-      }
+        if (data) setAudioUrl(data);
+      } catch(e) {}
     };
     loadAudio();
-    // Cleanup audio on unmount or day change
-    return function() {
-      cancelled = true;
-      if (audioRef.current) { audioRef.current.pause(); audioRef.current = null; }
-      setPlaying(false);
-    };
   }, [dayNum]);
 
   var handlePlay = function() {
-    setAudioError(null);
     if (audioUrl) {
       // Play stored mp3
       if (audioRef.current) { audioRef.current.pause(); }
-      var audio;
-      try {
-        audio = new Audio(audioUrl);
-      } catch(e) {
-        setAudioError("Could not load audio.");
-        return;
-      }
+      var audio = new Audio(audioUrl);
       audioRef.current = audio;
       setPlaying(true);
-      audio.play().catch(function(err) {
-        setAudioError("Audio playback failed. Try again.");
-        setPlaying(false);
-      });
-      audio.onerror = function() { setAudioError("Audio file could not be played."); setPlaying(false); };
+      audio.play().catch(function() {});
       audio.onended = function() { setPlaying(false); };
     } else {
       // Fallback bell sound
@@ -1392,44 +1199,88 @@ function LessonView(props) {
     setPlaying(false);
   };
 
-  var MAX_AUDIO_SIZE = 10 * 1024 * 1024; // 10MB
-  var ALLOWED_AUDIO_TYPES = ["audio/mpeg", "audio/mp3", "audio/wav", "audio/ogg", "audio/m4a", "audio/x-m4a", "audio/mp4"];
   var handleUploadAudio = function(e) {
     var file = e.target.files && e.target.files[0];
     if (!file) return;
-    setUploadError(null);
-    setAudioError(null);
-    // Validate file size
-    if (file.size > MAX_AUDIO_SIZE) {
-      setUploadError("File too large. Maximum size is 10MB.");
-      e.target.value = "";
-      return;
-    }
-    // Validate file type
-    if (file.type && ALLOWED_AUDIO_TYPES.indexOf(file.type) < 0 && !file.type.startsWith("audio/")) {
-      setUploadError("Invalid file type. Please upload an audio file.");
-      e.target.value = "";
-      return;
-    }
     var reader = new FileReader();
     reader.onload = async function(ev) {
       var data = ev.target.result;
       setAudioUrl(data);
-      try {
-        await api.saveAudio(dayNum, data);
-        setUploadError(null);
-      } catch(err) {
-        setUploadError("Failed to save: " + err.message);
-        // Keep local preview so user can retry
-      }
-    };
-    reader.onerror = function() {
-      setUploadError("Failed to read audio file. Please try again.");
+      try { await api.saveAudio(dayNum, data); } catch(err) {}
     };
     reader.readAsDataURL(file);
   };
 
-  var handleComplete2 = function() { if (cooldownMsg) { setShowCooldown(true); return; } onComplete(dayNum); };
+  var handleSaveCheckin = async function() {
+    if (!props.onSaveCheckin) return;
+    setSavingCheckin(true);
+    try {
+      await props.onSaveCheckin(dayNum, {
+        state: checkinState,
+        energy: energy,
+        intention: intention,
+        note: note
+      });
+      setSavedCheckin(true);
+    } catch(e) {
+      console.error('[lumina] Save checkin failed:', e);
+      alert('Failed to save check-in. Please try again.');
+    }
+    setSavingCheckin(false);
+  };
+
+  var handleSaveReflection = async function() {
+    if (!props.onSaveReflection) return;
+    setSavingReflection(true);
+    try {
+      await props.onSaveReflection(dayNum, {
+        body: reflectionBody,
+        favorite: favoriteReflection
+      });
+      setSavedReflection(true);
+    } catch(e) {
+      console.error('[lumina] Save reflection failed:', e);
+      alert('Failed to save reflection. Please try again.');
+    }
+    setSavingReflection(false);
+  };
+
+  var handleComplete2 = async function() {
+    if (cooldownMsg) { setShowCooldown(true); return; }
+    if (props.onSaveCheckin) {
+      try {
+        await props.onSaveCheckin(dayNum, { state: checkinState, energy: energy, intention: intention, note: note });
+      } catch(e) {
+        console.error('[lumina] Save checkin on complete failed:', e);
+      }
+    }
+    if (props.onSaveReflection && reflectionBody.trim()) {
+      try {
+        await props.onSaveReflection(dayNum, { body: reflectionBody, favorite: favoriteReflection });
+      } catch(e) {
+        console.error('[lumina] Save reflection on complete failed:', e);
+      }
+    }
+    onComplete(dayNum);
+  };
+
+  var adaptive = getAdaptiveSupport(user, dayData, {
+    state: checkinState,
+    energy: energy,
+    intention: intention
+  }, props.reentryPlan);
+  var resurfaced = props.resurfaced;
+  var stateMeta = getCheckinStateMeta(checkinState);
+  var fieldStyle = {
+    width: "100%",
+    borderRadius: 12,
+    border: "1px solid #e4dccf",
+    padding: "12px 14px",
+    fontFamily: B,
+    fontSize: 14,
+    color: "#3a3028",
+    background: "#fff"
+  };
 
   return (
     <div style={{ flex: 1, overflow: "auto", padding: "16px 20px 28px", animation: "fadeIn 0.4s ease" }}>
@@ -1444,11 +1295,31 @@ function LessonView(props) {
         </div>
       </div>
 
+      <div style={{ background: "linear-gradient(135deg, " + adaptive.color + "16, #fff)", borderRadius: 16, padding: "16px 18px", marginBottom: 16, border: "1px solid " + adaptive.color + "28", boxShadow: "0 2px 10px rgba(0,0,0,0.04)" }}>
+        <p style={{ fontFamily: B, fontSize: 11, fontWeight: 700, letterSpacing: 2, color: adaptive.color, textTransform: "uppercase", marginBottom: 6 }}>{adaptive.eyebrow}</p>
+        <h3 style={{ fontFamily: F, fontSize: 22, fontWeight: 400, color: "#3a3028", marginBottom: 8 }}>{adaptive.title}</h3>
+        <p style={{ fontFamily: B, fontSize: 13, color: "#5a4e40", lineHeight: 1.7, marginBottom: 8 }}>{adaptive.body}</p>
+        <p style={{ fontFamily: B, fontSize: 12, color: "#7a6b5c", marginBottom: 4 }}>{adaptive.focus}</p>
+        <p style={{ fontFamily: F, fontSize: 16, color: "#6b5e50" }}>{adaptive.prompt}</p>
+      </div>
+
+      {resurfaced && (
+        <div style={{ background: "#fff", borderRadius: 16, padding: "16px 18px", marginBottom: 16, boxShadow: "0 2px 10px rgba(0,0,0,0.04)", border: "1px solid #eadfcf" }}>
+          <p style={{ fontFamily: B, fontSize: 11, fontWeight: 700, letterSpacing: 2, color: "#8a7e6e", textTransform: "uppercase", marginBottom: 6 }}>
+            {l(user, "Resurfaced reflection", "浮かび上がった振り返り")}
+          </p>
+          <h3 style={{ fontFamily: F, fontSize: 20, fontWeight: 400, color: "#3a3028", marginBottom: 8 }}>
+            {l(user, "Day " + resurfaced.day + ": " + resurfaced.title, "第" + resurfaced.day + "日: " + resurfaced.title)}
+          </h3>
+          <p style={{ fontFamily: B, fontSize: 13, color: "#5a4e40", lineHeight: 1.7 }}>{resurfaced.excerpt}</p>
+        </div>
+      )}
+
       {/* Audio player with mp3 support */}
       <div style={{ background: "#fff", borderRadius: 14, padding: "14px 16px", marginBottom: 16, boxShadow: "0 2px 10px rgba(0,0,0,0.04)" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-          <button onClick={playing ? handlePause : handlePlay} style={{ width: 48, height: 48, borderRadius: "50%", border: "none", cursor: "pointer", background: playing ? cat.color + "80" : cat.color, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, boxShadow: "0 3px 12px " + cat.color + "50" }}>
-            {playing ? <div style={{ display: "flex", gap: 3 }}><div style={{ width: 3, height: 14, background: "#fff", borderRadius: 2 }} /><div style={{ width: 3, height: 14, background: "#fff", borderRadius: 2 }} /></div> : <svg width="20" height="20" viewBox="0 0 24 24" fill="#fff"><polygon points="6,3 20,12 6,21" /></svg>}
+          <button type="button" aria-label={playing ? l(user, "Pause today's guidance audio", "今日のガイダンス音声を一時停止") : l(user, "Play today's guidance audio", "今日のガイダンス音声を再生")} onClick={playing ? handlePause : handlePlay} style={{ width: 48, height: 48, borderRadius: "50%", border: "none", cursor: "pointer", background: playing ? cat.color + "80" : cat.color, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, boxShadow: "0 3px 12px " + cat.color + "50" }}>
+            {playing ? <div aria-hidden="true" style={{ display: "flex", gap: 3 }}><div style={{ width: 3, height: 14, background: "#fff", borderRadius: 2 }} /><div style={{ width: 3, height: 14, background: "#fff", borderRadius: 2 }} /></div> : <svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="#fff"><polygon points="6,3 20,12 6,21" /></svg>}
           </button>
           <div style={{ flex: 1 }}>
             <p style={{ fontFamily: B, fontSize: 14, fontWeight: 700, color: "#3a3028" }}>{t(user, "todaysGuidance")}</p>
@@ -1458,20 +1329,60 @@ function LessonView(props) {
             </div>
           </div>
         </div>
-        {/* Audio error display */}
-        {audioError && (
-          <p style={{ fontFamily: B, fontSize: 11, color: "#c0524a", marginTop: 8 }}>{audioError}</p>
-        )}
         {/* MP3 upload */}
         <label style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 10, cursor: "pointer", padding: "6px 0" }}>
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#a09488" strokeWidth="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
           <span style={{ fontFamily: B, fontSize: 11, color: "#a09488" }}>{audioUrl ? t(user, "replaceMp3") : t(user, "uploadMp3")}</span>
           <input type="file" accept="audio/mp3,audio/mpeg,audio/*" onChange={handleUploadAudio} style={{ display: "none" }} />
         </label>
-        {/* Upload error display */}
-        {uploadError && (
-          <p style={{ fontFamily: B, fontSize: 11, color: "#c0524a", marginTop: 4 }}>{uploadError}</p>
-        )}
+      </div>
+
+      <div style={{ background: "#fff", borderRadius: 14, padding: "18px 18px", marginBottom: 16, boxShadow: "0 2px 10px rgba(0,0,0,0.04)" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 12 }}>
+          <div>
+            <h3 style={{ fontFamily: F, fontSize: 21, fontWeight: 400, color: "#3a3028" }}>{l(user, "Arrival check-in", "今の自分をチェック")}</h3>
+            <p style={{ fontFamily: B, fontSize: 12, color: "#8a7e6e", lineHeight: 1.6 }}>{l(user, "Let today's guidance meet your actual state.", "今日のガイダンスを、いまの自分に合わせます。")}</p>
+          </div>
+          {savedCheckin && <span style={{ fontFamily: B, fontSize: 11, color: "#5a9a5e", fontWeight: 700 }}>{l(user, "Saved", "保存済み")}</span>}
+        </div>
+
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 12 }}>
+          {CHECKIN_STATES.map(function(option) {
+            var active = option.id === checkinState;
+            return (
+              <button
+                key={option.id}
+                onClick={function() { setCheckinState(option.id); setSavedCheckin(false); }}
+                style={{
+                  padding: "8px 12px",
+                  borderRadius: 999,
+                  border: active ? "none" : "1px solid #e4dccf",
+                  background: active ? option.color : "#fff",
+                  color: active ? "#fff" : "#6b5e50",
+                  fontFamily: B,
+                  fontSize: 12,
+                  cursor: "pointer"
+                }}
+              >
+                {l(user, option.en, option.ja)}
+              </button>
+            );
+          })}
+        </div>
+
+        <div style={{ marginBottom: 12 }}>
+          <p style={{ fontFamily: B, fontSize: 12, color: "#7a6b5c", marginBottom: 6 }}>{l(user, "Energy", "エネルギー")}: {energy}/5</p>
+          <input type="range" min="1" max="5" value={energy} onChange={function(e) { setEnergy(Number(e.target.value)); setSavedCheckin(false); }} style={{ width: "100%", accentColor: stateMeta.color }} />
+        </div>
+
+        <div style={{ display: "grid", gap: 10 }}>
+          <input value={intention} onChange={function(e) { setIntention(e.target.value); setSavedCheckin(false); }} placeholder={l(user, "Today's intention", "今日の意図")} style={fieldStyle} />
+          <textarea value={note} onChange={function(e) { setNote(e.target.value); setSavedCheckin(false); }} placeholder={l(user, "What feels true right now?", "いま本当に感じていることは？")} rows={4} style={fieldStyle} />
+        </div>
+
+        <button onClick={handleSaveCheckin} disabled={savingCheckin} style={{ marginTop: 12, width: "100%", padding: "12px 0", borderRadius: 12, border: "none", background: "#4a3f33", color: "#fff", fontFamily: B, fontSize: 13, cursor: "pointer" }}>
+          {savingCheckin ? "..." : l(user, "Save check-in", "チェックインを保存")}
+        </button>
       </div>
 
       {/* Lesson text */}
@@ -1492,6 +1403,25 @@ function LessonView(props) {
         <p style={{ fontFamily: B, fontSize: 10, fontWeight: 700, letterSpacing: 2, color: "#8a7e6e", textTransform: "uppercase", marginBottom: 8 }}>{t(user, "todaysMantra")}</p>
         <p style={{ fontFamily: F, fontStyle: "italic", fontSize: 20, fontWeight: 400, color: "#3a3028", lineHeight: 1.5 }}>{'"' + dayData.mantra + '"'}</p>
         <p style={{ fontFamily: B, fontSize: 12, color: "#a09488", marginTop: 10 }}>{t(user, "breathe")}</p>
+      </div>
+
+      <div style={{ background: "#fff", borderRadius: 14, padding: "18px 18px", marginBottom: 16, boxShadow: "0 2px 10px rgba(0,0,0,0.04)" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 12 }}>
+          <div>
+            <h3 style={{ fontFamily: F, fontSize: 21, fontWeight: 400, color: "#3a3028" }}>{l(user, "Reflection", "リフレクション")}</h3>
+            <p style={{ fontFamily: B, fontSize: 12, color: "#8a7e6e", lineHeight: 1.6 }}>{l(user, "Capture the line you want future-you to hear again.", "未来の自分にもう一度届けたい言葉を残しましょう。")}</p>
+          </div>
+          {savedReflection && <span style={{ fontFamily: B, fontSize: 11, color: "#5a9a5e", fontWeight: 700 }}>{l(user, "Saved", "保存済み")}</span>}
+        </div>
+
+        <textarea value={reflectionBody} onChange={function(e) { setReflectionBody(e.target.value); setSavedReflection(false); }} placeholder={l(user, "What shifted in you today?", "今日、自分の中で何が動きましたか？")} rows={7} style={fieldStyle} />
+        <label style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 12, cursor: "pointer" }}>
+          <input type="checkbox" checked={favoriteReflection} onChange={function(e) { setFavoriteReflection(e.target.checked); setSavedReflection(false); }} />
+          <span style={{ fontFamily: B, fontSize: 13, color: "#6b5e50" }}>{l(user, "Save this to my insight library", "この気づきをインサイトライブラリに残す")}</span>
+        </label>
+        <button onClick={handleSaveReflection} disabled={savingReflection} style={{ marginTop: 12, width: "100%", padding: "12px 0", borderRadius: 12, border: "none", background: cat.color, color: "#fff", fontFamily: B, fontSize: 13, cursor: "pointer" }}>
+          {savingReflection ? "..." : l(user, "Save reflection", "リフレクションを保存")}
+        </button>
       </div>
 
       {/* Cooldown message */}
@@ -1525,6 +1455,20 @@ function ProfileView(props) {
   var phase = PHASES[phaseIdx];
   var onUpdateLang = props.onUpdateLang;
   var currentLang = user.lang || "en";
+  var billing = props.billing || {};
+  var entitlement = billing.entitlement || {};
+  var metrics = props.metrics || {};
+  var [accountBusy, setAccountBusy] = useState("");
+  var [accountStatus, setAccountStatus] = useState("");
+  var [accountError, setAccountError] = useState("");
+  var [deletePassword, setDeletePassword] = useState("");
+  var [deleteConfirm, setDeleteConfirm] = useState("");
+  var favoriteDays = getSortedDayNumbers(props.reflections || {}).filter(function(dayNum) {
+    return props.reflections[dayNum] && props.reflections[dayNum].favorite;
+  }).slice(-4).reverse();
+  var latestReflectionDays = favoriteDays.length ? favoriteDays : getSortedDayNumbers(props.reflections || {}).filter(function(dayNum) {
+    return props.reflections[dayNum] && props.reflections[dayNum].body;
+  }).slice(-4).reverse();
   // Phase name + desc + quote translated
   var phNames = ["phAwakening","phDeepening","phExpanding","phTransforming","phIntegrating","phRadiating"];
   var phDescs = ["phDescAwakening","phDescDeepening","phDescExpanding","phDescTransforming","phDescIntegrating","phDescRadiating"];
@@ -1532,6 +1476,38 @@ function ProfileView(props) {
   var phaseName = t(user, phNames[phaseIdx]);
   var phaseDesc = t(user, phDescs[phaseIdx]);
   var phaseQuote = t(user, phQuotes[phaseIdx]);
+  var cancelScheduled = !!(entitlement.cancelAt || entitlement.canceledAt);
+  var statusLabel = entitlement.hasAccess
+    ? l(user, "Active " + (entitlement.planCode === "annual" ? "annual" : "monthly") + " membership", (entitlement.planCode === "annual" ? "年額" : "月額") + "メンバーシップ利用中")
+    : l(user, "Membership inactive", "メンバーシップ停止中");
+
+  var handleExportClick = async function() {
+    setAccountBusy("export");
+    setAccountError("");
+    setAccountStatus("");
+    try {
+      await props.onExportData();
+      setAccountStatus(l(user, "Your Lumina export has been downloaded.", "Luminaデータを書き出しました。"));
+    } catch (e) {
+      setAccountError(e && e.message ? e.message : l(user, "Unable to export your Lumina data right now.", "現在Luminaデータを書き出せません。"));
+    } finally {
+      setAccountBusy("");
+    }
+  };
+
+  var handleDeleteClick = async function() {
+    setAccountBusy("delete");
+    setAccountError("");
+    setAccountStatus("");
+    try {
+      await props.onDeleteAccount(deletePassword, deleteConfirm);
+    } catch (e) {
+      setAccountError(e && e.message ? e.message : l(user, "Unable to delete this account right now.", "現在このアカウントを削除できません。"));
+      setAccountBusy("");
+      return;
+    }
+    setAccountBusy("");
+  };
 
   return (
     <div style={{ flex: 1, overflow: "auto", padding: "20px 20px", animation: "fadeIn 0.4s ease" }}>
@@ -1583,6 +1559,148 @@ function ProfileView(props) {
         <p style={{ fontFamily: B, fontSize: 11, color: "#a09488", marginTop: 6, textAlign: "center" }}>{tf(user, "ofDays")(n)}</p>
       </div>
 
+      <div style={{ background: "#fff", borderRadius: 14, padding: 16, marginBottom: 16, boxShadow: "0 2px 8px rgba(0,0,0,0.03)" }}>
+        <p style={{ fontFamily: B, fontSize: 12, fontWeight: 700, letterSpacing: 2, color: "#8a7e6e", textTransform: "uppercase", marginBottom: 8 }}>{l(user, "Membership", "メンバーシップ")}</p>
+        <h3 style={{ fontFamily: F, fontSize: 22, fontWeight: 400, color: "#3a3028", marginBottom: 6 }}>{statusLabel}</h3>
+        <p style={{ fontFamily: B, fontSize: 13, color: "#5a4e40", lineHeight: 1.6, marginBottom: 12 }}>
+          {entitlement.currentPeriodEnd
+            ? l(user, "Current period ends " + new Date(entitlement.currentPeriodEnd).toLocaleDateString(), "現在の利用期間終了日: " + new Date(entitlement.currentPeriodEnd).toLocaleDateString())
+            : l(user, "Billing is handled securely on namibarden.com.", "請求は namibarden.com で安全に管理されます。")}
+        </p>
+        <div style={{ display: "flex", gap: 10 }}>
+          <button onClick={props.onOpenPortal} style={{ flex: 1, padding: "12px 0", borderRadius: 12, border: "1px solid #ddd3c6", background: "#fff", color: "#6b5e50", fontFamily: B, fontSize: 13, cursor: "pointer" }}>
+            {l(user, "Manage billing", "請求を管理")}
+          </button>
+          <button onClick={function() { props.onStartCheckout(entitlement.planCode === "annual" ? "lumina-annual" : "lumina-monthly"); }} style={{ flex: 1, padding: "12px 0", borderRadius: 12, border: "none", background: "#4a3f33", color: "#fff", fontFamily: B, fontSize: 13, cursor: "pointer" }}>
+            {entitlement.hasAccess ? l(user, "Open checkout", "決済ページを開く") : l(user, "Activate access", "アクセスを有効化")}
+          </button>
+        </div>
+      </div>
+
+      <div style={{ background: "#fff", borderRadius: 14, padding: 16, marginBottom: 16, boxShadow: "0 2px 8px rgba(0,0,0,0.03)" }}>
+        <p style={{ fontFamily: B, fontSize: 12, fontWeight: 700, letterSpacing: 2, color: "#8a7e6e", textTransform: "uppercase", marginBottom: 8 }}>{l(user, "Data and privacy", "データとプライバシー")}</p>
+        <p style={{ fontFamily: B, fontSize: 13, color: "#5a4e40", lineHeight: 1.7, marginBottom: 10 }}>
+          {l(
+            user,
+            "Download your Lumina data anytime. Exports include your profile, progress, check-ins, reflections, saved audio, and Lumina usage history.",
+            "プロフィール、進捗、チェックイン、リフレクション、保存した音声、Luminaの利用履歴を書き出せます。"
+          )}
+        </p>
+        <p style={{ fontFamily: B, fontSize: 12, color: "#8a7e6e", lineHeight: 1.7, marginBottom: 12 }}>
+          {l(
+            user,
+            "Billing and invoice records may still remain in NamiBarden and Stripe where required for accounting or legal compliance.",
+            "請求書や決済履歴は、会計や法令対応のために NamiBarden と Stripe 側に残る場合があります。"
+          )}
+        </p>
+        <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
+          <button type="button" onClick={handleExportClick} disabled={!!accountBusy} style={{ flex: 1, padding: "12px 0", borderRadius: 12, border: "1px solid #ddd3c6", background: "#fff", color: "#6b5e50", fontFamily: B, fontSize: 13, cursor: accountBusy ? "wait" : "pointer" }}>
+            {accountBusy === "export" ? l(user, "Preparing export...", "書き出し中...") : l(user, "Export my data", "データを書き出す")}
+          </button>
+          <a href="mailto:contact@namibarden.com" style={{ flex: 1, padding: "12px 0", borderRadius: 12, border: "1px solid #eadfcf", background: "#f8f3eb", color: "#6b5e50", fontFamily: B, fontSize: 13, textAlign: "center", textDecoration: "none" }}>
+            {l(user, "Email support", "サポートに連絡")}
+          </a>
+        </div>
+
+        <div style={{ borderRadius: 12, background: "#f8f3eb", padding: "14px 14px 12px", border: "1px solid #eadfcf" }}>
+          <p style={{ fontFamily: B, fontSize: 13, fontWeight: 700, color: "#5a4e40", marginBottom: 6 }}>{l(user, "Delete account", "アカウント削除")}</p>
+          <p style={{ fontFamily: B, fontSize: 12, color: "#8a7e6e", lineHeight: 1.7, marginBottom: 10 }}>
+            {cancelScheduled
+              ? l(user, "Your cancellation is already scheduled. Deleting now removes Lumina app data immediately.", "すでに解約予定が入っています。今削除すると Lumina のアプリデータはすぐに消去されます。")
+              : l(user, "Cancel any active Lumina membership in Manage billing before deleting this account. This removes your Lumina journal, check-ins, reflections, saved audio, and app session.", "アカウント削除前に、請求管理から有効な Lumina メンバーシップを解約してください。削除すると Lumina の記録、チェックイン、リフレクション、保存した音声、アプリのセッションが消去されます。")}
+          </p>
+          <div style={{ display: "grid", gap: 10 }}>
+            <input
+              type="password"
+              value={deletePassword}
+              onChange={function(e) { setDeletePassword(e.target.value); }}
+              placeholder={l(user, "Confirm your password", "パスワードを確認")}
+              style={{ width: "100%", padding: "12px 14px", borderRadius: 12, border: "1px solid #ddd3c6", background: "#fff", color: "#3a3028", fontFamily: B, fontSize: 13 }}
+            />
+            <input
+              type="text"
+              value={deleteConfirm}
+              onChange={function(e) { setDeleteConfirm(e.target.value.toUpperCase()); }}
+              placeholder={l(user, 'Type DELETE to confirm', '確認のため DELETE と入力')}
+              style={{ width: "100%", padding: "12px 14px", borderRadius: 12, border: "1px solid #ddd3c6", background: "#fff", color: "#3a3028", fontFamily: B, fontSize: 13, letterSpacing: deleteConfirm ? 1 : 0 }}
+            />
+            <button
+              type="button"
+              onClick={handleDeleteClick}
+              disabled={!!accountBusy || !deletePassword.trim() || deleteConfirm !== "DELETE"}
+              style={{ width: "100%", padding: "12px 0", borderRadius: 12, border: "none", background: "#8c3f3f", color: "#fff", fontFamily: B, fontSize: 13, cursor: (!!accountBusy || !deletePassword.trim() || deleteConfirm !== "DELETE") ? "not-allowed" : "pointer", opacity: (!!accountBusy || !deletePassword.trim() || deleteConfirm !== "DELETE") ? 0.6 : 1 }}
+            >
+              {accountBusy === "delete" ? l(user, "Deleting account...", "削除中...") : l(user, "Delete my Lumina account", "Luminaアカウントを削除")}
+            </button>
+          </div>
+        </div>
+
+        {(accountStatus || accountError) && (
+          <p style={{ fontFamily: B, fontSize: 12, color: accountError ? "#a63f3f" : "#4d8751", lineHeight: 1.6, marginTop: 12 }}>
+            {accountError || accountStatus}
+          </p>
+        )}
+      </div>
+
+      <div style={{ background: "#fff", borderRadius: 14, padding: 16, marginBottom: 16, boxShadow: "0 2px 8px rgba(0,0,0,0.03)" }}>
+        <p style={{ fontFamily: B, fontSize: 12, fontWeight: 700, letterSpacing: 2, color: "#8a7e6e", textTransform: "uppercase", marginBottom: 10 }}>{l(user, "Compassionate metrics", "やさしい指標")}</p>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 10 }}>
+          {[
+            { label: l(user, "Days witnessed", "見届けた日数"), value: metrics.completedCount || 0 },
+            { label: l(user, "Check-ins saved", "保存したチェックイン"), value: metrics.checkinCount || 0 },
+            { label: l(user, "Returns after pauses", "休止後に戻った回数"), value: metrics.returnCount || 0 },
+            { label: l(user, "Favorite insights", "お気に入りの気づき"), value: metrics.favoriteCount || 0 }
+          ].map(function(item) {
+            return (
+              <div key={item.label} style={{ borderRadius: 12, background: "#f8f3eb", padding: "14px 12px" }}>
+                <p style={{ fontFamily: F, fontSize: 24, color: "#3a3028" }}>{item.value}</p>
+                <p style={{ fontFamily: B, fontSize: 11, color: "#8a7e6e", lineHeight: 1.5 }}>{item.label}</p>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {props.weeklySynthesis && (
+        <div style={{ background: "linear-gradient(135deg, " + props.weeklySynthesis.color + "14, #fff)", borderRadius: 14, padding: 16, marginBottom: 16, boxShadow: "0 2px 8px rgba(0,0,0,0.03)", border: "1px solid " + props.weeklySynthesis.color + "25" }}>
+          <p style={{ fontFamily: B, fontSize: 12, fontWeight: 700, letterSpacing: 2, color: props.weeklySynthesis.color, textTransform: "uppercase", marginBottom: 8 }}>{props.weeklySynthesis.title}</p>
+          <p style={{ fontFamily: B, fontSize: 13, color: "#5a4e40", lineHeight: 1.7, marginBottom: 8 }}>{props.weeklySynthesis.summary}</p>
+          <p style={{ fontFamily: F, fontSize: 18, color: "#3a3028", marginBottom: 8 }}>{props.weeklySynthesis.focus}</p>
+          {props.weeklySynthesis.keywords && props.weeklySynthesis.keywords.length > 0 && (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+              {props.weeklySynthesis.keywords.map(function(keyword) {
+                return <span key={keyword} style={{ padding: "5px 10px", borderRadius: 999, background: "#fff", border: "1px solid #eadfcf", fontFamily: B, fontSize: 11, color: "#7a6b5c" }}>{keyword}</span>;
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      <div style={{ background: "#fff", borderRadius: 14, padding: 16, marginBottom: 16, boxShadow: "0 2px 8px rgba(0,0,0,0.03)" }}>
+        <p style={{ fontFamily: B, fontSize: 12, fontWeight: 700, letterSpacing: 2, color: "#8a7e6e", textTransform: "uppercase", marginBottom: 10 }}>{l(user, "Insight library", "インサイトライブラリ")}</p>
+        {latestReflectionDays.length === 0 ? (
+          <p style={{ fontFamily: B, fontSize: 13, color: "#8a7e6e", lineHeight: 1.7 }}>{l(user, "Save a reflection as a favorite and it will live here.", "リフレクションをお気に入りにすると、ここに残ります。")}</p>
+        ) : (
+          <div style={{ display: "grid", gap: 10 }}>
+            {latestReflectionDays.map(function(dayNum) {
+              var item = props.reflections[dayNum];
+              return (
+                <div key={dayNum} style={{ padding: "12px 14px", borderRadius: 12, background: "#f8f3eb" }}>
+                  <p style={{ fontFamily: B, fontSize: 11, fontWeight: 700, color: "#8a7e6e", marginBottom: 4 }}>
+                    {l(user, "Day " + dayNum, "第" + dayNum + "日")}
+                    {item.favorite ? " • " + l(user, "favorite", "お気に入り") : ""}
+                  </p>
+                  <p style={{ fontFamily: F, fontSize: 18, color: "#3a3028", marginBottom: 6 }}>{getDayData(dayNum, user).title}</p>
+                  <p style={{ fontFamily: B, fontSize: 13, color: "#5a4e40", lineHeight: 1.7 }}>
+                    {item.body.length > 180 ? item.body.slice(0, 180).trim() + "..." : item.body}
+                  </p>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
       {/* Language toggle */}
       <div style={{ background: "#fff", borderRadius: 14, padding: 16, marginBottom: 16, boxShadow: "0 2px 8px rgba(0,0,0,0.03)" }}>
         <p style={{ fontFamily: B, fontSize: 12, fontWeight: 600, color: "#5a4e40", marginBottom: 10 }}>{t(user, "language")}</p>
@@ -1598,101 +1716,318 @@ function ProfileView(props) {
   );
 }
 
+function LoadingScreen() {
+  return (
+    <main aria-label="Loading Lumina" style={{ minHeight: "100dvh", background: "#f5f0e8", display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}>
+      <style>{CSS}</style>
+      <div style={{ width: "100%", maxWidth: 380, background: "rgba(255,255,255,0.92)", borderRadius: 22, padding: "30px 24px", boxShadow: "0 12px 32px rgba(58,48,40,0.08)", textAlign: "center" }}>
+        <Logo size={68} />
+        <h1 style={{ fontFamily: F, fontWeight: 300, fontSize: 32, color: "#4a3f33", letterSpacing: 8, margin: "12px 0 6px" }}>LUMINA</h1>
+        <p style={{ fontFamily: B, fontSize: 12, color: MUTED, letterSpacing: 2, marginBottom: 10 }}>{TXT.en.subtitle}</p>
+        <p style={{ fontFamily: B, fontSize: 13, color: "#5a4e40", lineHeight: 1.7 }}>Preparing your journal and membership status.</p>
+      </div>
+    </main>
+  );
+}
+
 // ─── MAIN ───
 function LuminaApp() {
   var [user, setUser] = useState(null);
   var [progress, setProgress] = useState({});
+  var [checkins, setCheckins] = useState({});
+  var [reflections, setReflections] = useState({});
+  var [billing, setBilling] = useState(null);
   var [view, setView] = useState("journey");
   var [selDay, setSelDay] = useState(null);
+  var [milestone, setMilestone] = useState(null);
   var [loading, setLoading] = useState(true);
-  var [appError, setAppError] = useState(null);
+  var [activatingAccess, setActivatingAccess] = useState(false);
+  var analyticsSeenRef = useRef({});
   // Test mode only activates via ?test in URL - invisible to regular users
   var testMode = typeof window !== "undefined" && window.location.search.indexOf("test") >= 0;
+  var billingSuccess = typeof window !== "undefined" && window.location.search.indexOf("billing=success") >= 0;
 
-  // Register global session expiry handler to force re-login
-  useEffect(function() {
-    api.onSessionExpired(function() {
+  var loadDashboard = async function(forceBilling, explicitUser) {
+    var sessionUser = explicitUser;
+    if (!sessionUser) sessionUser = await api.getSession();
+    if (!sessionUser) {
       setUser(null);
       setProgress({});
-      setView("journey");
-      setSelDay(null);
-    });
-  }, []);
+      setCheckins({});
+      setReflections({});
+      setBilling(null);
+      return { user: null, billing: null };
+    }
 
-  // Auto-dismiss error toast after 5 seconds
-  useEffect(function() {
-    if (!appError) return;
-    var timer = setTimeout(function() { setAppError(null); }, 5000);
-    return function() { clearTimeout(timer); };
-  }, [appError]);
+    setUser(sessionUser);
+    var results = await Promise.allSettled([
+      api.getProgress(),
+      api.getCheckins(),
+      api.getReflections(),
+      api.getBillingStatus(!!forceBilling)
+    ]);
+    var billingData = results[3].status === "fulfilled" ? (results[3].value || null) : null;
+    setProgress(results[0].status === "fulfilled" ? (results[0].value || {}) : {});
+    setCheckins(results[1].status === "fulfilled" ? (results[1].value || {}) : {});
+    setReflections(results[2].status === "fulfilled" ? (results[2].value || {}) : {});
+    setBilling(billingData);
+
+    var hasProgramAccess = testMode || hasLuminaAccess(billingData);
+    if (hasProgramAccess) {
+      try {
+        await loadProgramContent();
+      } catch (e) {
+        console.error("Program content preload failed:", e);
+      }
+    }
+
+    if (typeof window !== "undefined" && forceBilling && hasLuminaAccess(billingData)) {
+      window.history.replaceState({}, "", window.location.pathname);
+    }
+    return { user: sessionUser, billing: billingData };
+  };
+
+  var refreshBillingUntilActive = async function(explicitUser) {
+    var sessionUser = explicitUser || user;
+    if (!sessionUser) return { user: null, billing: null };
+    setActivatingAccess(true);
+    try {
+      for (var attempt = 0; attempt < 6; attempt++) {
+        if (attempt > 0) await wait(attempt < 3 ? 1500 : 2500);
+        var dashboard = await loadDashboard(true, sessionUser);
+        sessionUser = dashboard && dashboard.user ? dashboard.user : sessionUser;
+        if (testMode || hasLuminaAccess(dashboard && dashboard.billing)) return dashboard;
+      }
+      return { user: sessionUser, billing: null };
+    } finally {
+      setActivatingAccess(false);
+    }
+  };
 
   useEffect(function() {
     var init = async function() {
+      var dashboard = null;
       try {
-        var u = await api.getSession();
-        if (u) {
-          setUser(u);
-          try { var p = await api.getProgress(); setProgress(p || {}); } catch(e) { setProgress({}); }
+        dashboard = await loadDashboard(billingSuccess);
+        if (billingSuccess) {
+          trackEvent("billing_checkout_returned", {
+            sessionId: typeof window !== "undefined" ? (new URLSearchParams(window.location.search).get("session_id") || null) : null,
+            hasAccess: !!(dashboard && hasLuminaAccess(dashboard.billing))
+          }, { email: dashboard && dashboard.user ? dashboard.user.email : null });
+          if (dashboard && dashboard.user && !testMode && !hasLuminaAccess(dashboard.billing)) {
+            dashboard = await refreshBillingUntilActive(dashboard.user);
+          }
         }
       } catch(e) {
-        // Session check failed -- user will see login screen
+        console.error('[lumina] Dashboard load failed:', e);
       }
       setLoading(false);
     };
     init();
   }, []);
+
+  var metrics = getJourneyMetrics(progress, checkins, reflections);
+  var weeklySynthesis = user ? getWeeklySynthesis(user, progress, checkins, reflections) : null;
+
+  useEffect(function() {
+    if (!user || !user.email || !hasLuminaAccess(billing)) return;
+    var entitlement = billing && billing.entitlement ? billing.entitlement : {};
+    var key = "billing_access_granted:" + user.email + ":" + (entitlement.planCode || "unknown") + ":" + (entitlement.accessState || "active");
+    if (analyticsSeenRef.current[key]) return;
+    analyticsSeenRef.current[key] = true;
+    trackEvent("billing_access_granted", {
+      planCode: entitlement.planCode || null,
+      accessState: entitlement.accessState || null,
+      status: entitlement.status || null
+    }, { email: user.email });
+  }, [user && user.email, billing && billing.entitlement && billing.entitlement.hasAccess, billing && billing.entitlement && billing.entitlement.planCode, billing && billing.entitlement && billing.entitlement.accessState, billing && billing.entitlement && billing.entitlement.status]);
+
+  useEffect(function() {
+    if (!user || !user.email || !weeklySynthesis) return;
+    var key = "weekly_synthesis_viewed:" + user.email + ":" + weeklySynthesis.weekIndex;
+    if (analyticsSeenRef.current[key]) return;
+    analyticsSeenRef.current[key] = true;
+    trackEvent("weekly_synthesis_viewed", {
+      weekIndex: weeklySynthesis.weekIndex,
+      witnessed: weeklySynthesis.witnessed,
+      keywords: weeklySynthesis.keywords || []
+    }, { email: user.email });
+  }, [user && user.email, weeklySynthesis && weeklySynthesis.weekIndex]);
+
+  useEffect(function() {
+    if (!user) return;
+    var count = getCompletedCount(progress);
+    var data = getMilestoneData(count, user);
+    if (!data || typeof localStorage === "undefined") return;
+    var key = "lumina_milestone_seen_" + user.email + "_" + count;
+    if (localStorage.getItem(key)) return;
+    localStorage.setItem(key, "1");
+    setMilestone({ count: count, title: data.title, body: data.body });
+  }, [user && user.email, getCompletedCount(progress)]);
+
   var handleLogin = async function(ud) {
-    setUser(ud);
-    setAppError(null);
-    try { var p = await api.getProgress(); setProgress(p || {}); } catch(e) { setProgress({}); }
+    setLoading(true);
+    try { await loadDashboard(billingSuccess, ud); } catch(e) {}
+    setLoading(false);
   };
   var handleLogout = async function() {
-    try { await api.logout(); } catch(e) { /* proceed with local cleanup even if server call fails */ }
-    setUser(null); setProgress({}); setView("journey"); setSelDay(null); setAppError(null);
+    await api.logout();
+    setUser(null);
+    setProgress({});
+    setCheckins({});
+    setReflections({});
+    setBilling(null);
+    setView("journey");
+    setSelDay(null);
   };
   var handleComplete = async function(dayNum) {
-    setAppError(null);
-    var prevProgress = progress;
     var np = Object.assign({}, progress);
     np[dayNum] = { completedAt: new Date().toISOString() };
     setProgress(np);
-    try {
-      await api.completeDay(dayNum);
-    } catch(e) {
-      // Rollback optimistic update on failure
-      setProgress(prevProgress);
-      setAppError(e.message || "Failed to save progress. Please try again.");
-      return;
-    }
+    try { await api.completeDay(dayNum); } catch(e) {}
+    trackEvent("day_completed", {
+      dayNum: dayNum,
+      completedCount: getCompletedCount(np)
+    }, { email: user && user.email });
     setView("journey"); setSelDay(null);
   };
+  var handleSaveCheckin = async function(dayNum, payload) {
+    var next = Object.assign({}, checkins);
+    next[dayNum] = {
+      state: payload.state,
+      energy: payload.energy,
+      intention: payload.intention,
+      note: payload.note,
+      updatedAt: new Date().toISOString()
+    };
+    setCheckins(next);
+    await api.saveCheckin(dayNum, payload);
+    trackEvent("checkin_saved", {
+      dayNum: dayNum,
+      state: payload.state || null,
+      energy: payload.energy || null,
+      intention: payload.intention || null,
+      noteLength: payload.note ? String(payload.note).trim().length : 0
+    }, { email: user && user.email });
+  };
+  var handleSaveReflection = async function(dayNum, payload) {
+    var next = Object.assign({}, reflections);
+    next[dayNum] = {
+      body: payload.body,
+      favorite: !!payload.favorite,
+      updatedAt: new Date().toISOString()
+    };
+    setReflections(next);
+    await api.saveReflection(dayNum, payload);
+    trackEvent("reflection_saved", {
+      dayNum: dayNum,
+      favorite: !!payload.favorite,
+      bodyLength: payload.body ? String(payload.body).trim().length : 0
+    }, { email: user && user.email });
+  };
   var handleUpdateLang = async function(newLang) {
-    setAppError(null);
-    var prevUser = user;
     var updated = Object.assign({}, user, { lang: newLang });
     setUser(updated);
+    try { await api.updateLang(newLang); } catch(e) {}
+  };
+  var handleRefreshBilling = async function() {
+    trackEvent("billing_refresh_requested", {
+      justActivated: !!billingSuccess,
+      accessState: billing && billing.entitlement ? billing.entitlement.accessState || null : null,
+      status: billing && billing.entitlement ? billing.entitlement.status || null : null
+    }, { email: user && user.email });
     try {
-      await api.updateLang(newLang);
+      if (user && !testMode && (!billing || !billing.entitlement || !billing.entitlement.hasAccess)) {
+        await refreshBillingUntilActive(user);
+      } else {
+        await loadDashboard(true, user);
+      }
+    } catch(e) {}
+  };
+  var handleOpenBillingPortal = async function() {
+    trackEvent("billing_portal_opened", {
+      accessState: billing && billing.entitlement ? billing.entitlement.accessState || null : null,
+      status: billing && billing.entitlement ? billing.entitlement.status || null : null
+    }, { email: user && user.email });
+    try {
+      var session = await api.createBillingPortal(window.location.origin + "/");
+      if (session && session.url) {
+        window.location.href = session.url;
+        return;
+      }
+    } catch(e) {}
+    window.location.href = buildLuminaCheckoutUrl(user, "lumina-monthly");
+  };
+  var handleExportAccount = async function() {
+    try {
+      var result = await api.exportAccountData();
+      var url = window.URL.createObjectURL(result.blob);
+      var anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = result.filename || "lumina-export.json";
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.setTimeout(function() { window.URL.revokeObjectURL(url); }, 1000);
     } catch(e) {
-      // Rollback optimistic update on failure
-      setUser(prevUser);
-      setAppError(e.message || "Failed to update language. Please try again.");
+      console.error('[lumina] Export account failed:', e);
+      alert('Failed to export account data. Please try again.');
     }
   };
-  if (loading) return <div style={{ height: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: "#f5f0e8" }}><style>{CSS}</style><Logo size={60} /></div>;
+  var handleDeleteAccount = async function(password, confirmText) {
+    try {
+      await api.deleteAccount(password, confirmText);
+    } catch(e) {
+      console.error('[lumina] Delete account failed:', e);
+      alert('Failed to delete account. Please try again.');
+      return;
+    }
+    try {
+      await api.logout();
+    } catch(e) {
+      console.error('[lumina] Logout after delete failed:', e);
+    }
+    setUser(null);
+    setProgress({});
+    setCheckins({});
+    setReflections({});
+    setBilling(null);
+    setView("journey");
+    setSelDay(null);
+  };
+  var handleStartCheckout = function(planCode) {
+    trackEvent("billing_checkout_started", {
+      planCode: planCode,
+      accessState: billing && billing.entitlement ? billing.entitlement.accessState || null : null,
+      status: billing && billing.entitlement ? billing.entitlement.status || null : null
+    }, { email: user && user.email });
+    window.location.href = buildLuminaCheckoutUrl(user, planCode);
+  };
+
+  if (loading) return <LoadingScreen />;
   if (!user) return <AuthScreen onLogin={handleLogin} />;
+  if (!testMode && (!billing || !billing.entitlement || !billing.entitlement.hasAccess)) {
+    return <BillingScreen user={user} billing={billing} justActivated={billingSuccess} activatingAccess={activatingAccess} onCheckout={handleStartCheckout} onRefresh={handleRefreshBilling} onOpenPortal={handleOpenBillingPortal} />;
+  }
   // maxDay considers both startDate AND highest completed day (for test mode progress)
   var dayFromStart = Math.min(getDaysSinceStart(user.startDate), 90);
   var highestCompleted = 0;
   Object.keys(progress).forEach(function(k) { var n = Number(k); if (n > highestCompleted) highestCompleted = n; });
   var maxDay = testMode ? 90 : Math.max(dayFromStart, Math.min(highestCompleted + 1, 90));
   var activeDay = maxDay;
+  var foundUncompleted = false;
   for (var ad = 1; ad <= maxDay; ad++) {
-    if (!progress[ad]) { activeDay = ad; break; }
+    if (!progress[ad]) { activeDay = ad; foundUncompleted = true; break; }
   }
   // If all days completed, activeDay = maxDay (the last completed day)
   var handleSelectDay = function(d) { setSelDay(d); setView("lesson"); };
   var lessonDay = selDay || activeDay;
+  var lessonData = getDayData(lessonDay, user);
+  var lang = user ? user.lang : "en";
+  var metrics = getJourneyMetrics(progress, checkins, reflections);
+  var weeklySynthesis = getWeeklySynthesis(user, progress, checkins, reflections);
+  var reentryPlan = getReentryPlan(user, progress, lessonData);
+  var resurfaced = pickResurfacedReflection(lessonDay, reflections, user);
   // When switching to lesson tab via bottom nav, always go to current active day
   var handleTabClick = function(id) {
     if (id === "lesson") {
@@ -1733,33 +2068,70 @@ function LuminaApp() {
     }
   }
   var content;
-  if (view === "journey") content = <JourneyMap user={user} progress={progress} maxUnlockedDay={maxDay} onSelectDay={handleSelectDay} />;
-  else if (view === "lesson") content = <LessonView user={user} dayData={getDayData(lessonDay, user)} dayNum={lessonDay} isCompleted={!!progress[lessonDay]} onComplete={handleComplete} cooldownMsg={cooldownMsg} />;
-  else content = <ProfileView user={user} progress={progress} onLogout={handleLogout} onUpdateLang={handleUpdateLang} />;
+  if (view === "journey") {
+    content = <JourneyMap user={user} progress={progress} maxUnlockedDay={maxDay} onSelectDay={handleSelectDay} weeklySynthesis={weeklySynthesis} reentryPlan={reentryPlan} />;
+  } else if (view === "lesson") {
+    content = <LessonView
+      user={user}
+      dayData={lessonData}
+      dayNum={lessonDay}
+      isCompleted={!!progress[lessonDay]}
+      onComplete={handleComplete}
+      cooldownMsg={cooldownMsg}
+      checkin={checkins[lessonDay]}
+      reflection={reflections[lessonDay]}
+      resurfaced={resurfaced}
+      reentryPlan={reentryPlan}
+      onSaveCheckin={handleSaveCheckin}
+      onSaveReflection={handleSaveReflection}
+    />;
+  } else {
+    content = <ProfileView
+      user={user}
+      progress={progress}
+      reflections={reflections}
+      billing={billing}
+      metrics={metrics}
+      weeklySynthesis={weeklySynthesis}
+      onLogout={handleLogout}
+      onUpdateLang={handleUpdateLang}
+      onOpenPortal={handleOpenBillingPortal}
+      onStartCheckout={handleStartCheckout}
+      onExportData={handleExportAccount}
+      onDeleteAccount={handleDeleteAccount}
+    />;
+  }
   return (
-    <div style={{ height: "100vh", maxWidth: 430, margin: "0 auto", background: "#f5f0e8", display: "flex", flexDirection: "column", fontFamily: B, overflow: "hidden", position: "relative" }}>
+    <div style={{ height: "100dvh", maxWidth: 430, margin: "0 auto", background: "#f5f0e8", display: "flex", flexDirection: "column", fontFamily: B, overflow: "hidden" }}>
       <style>{CSS}</style>
-      <div style={{ padding: "12px 20px 10px", display: "flex", alignItems: "center", justifyContent: "space-between", background: "#fff", borderBottom: "1px solid #e8e2d8", flexShrink: 0 }}>
+      <header style={{ padding: "12px 20px 10px", display: "flex", alignItems: "center", justifyContent: "space-between", background: "#fff", borderBottom: "1px solid #e8e2d8", flexShrink: 0 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}><Logo size={30} /><span style={{ fontFamily: F, fontWeight: 400, fontSize: 17, color: "#3a3028", letterSpacing: 4 }}>LUMINA</span></div>
-        <div style={{ fontFamily: B, fontSize: 11, fontWeight: 600, color: "#8a7e6e", background: "#f5f0e8", padding: "4px 12px", borderRadius: 16 }}>{tf(user, "dayOf")(activeDay, 90)}</div>
-      </div>
-      {content}
-      {/* Error toast */}
-      {appError && (
-        <div onClick={function() { setAppError(null); }} style={{ position: "absolute", top: 60, left: "50%", transform: "translateX(-50%)", background: "#c0524a", color: "#fff", fontFamily: B, fontSize: 13, padding: "10px 20px", borderRadius: 12, boxShadow: "0 4px 16px rgba(0,0,0,0.15)", cursor: "pointer", zIndex: 100, maxWidth: "90%", textAlign: "center", animation: "fadeIn 0.3s ease" }}>
-          {appError}
-        </div>
-      )}
-      <div style={{ display: "flex", background: "#fff", borderTop: "1px solid #e8e2d8", padding: "4px 0 8px", flexShrink: 0 }}>
+        <div style={{ fontFamily: B, fontSize: 11, fontWeight: 600, color: MUTED, background: "#f5f0e8", padding: "4px 12px", borderRadius: 16 }}>{tf(user, "dayOf")(activeDay, 90)}</div>
+      </header>
+      <main aria-label={l(user, "Lumina journal", "Lumina ジャーナル")} style={{ flex: 1, minHeight: 0, display: "flex" }}>
+        {content}
+      </main>
+      <nav aria-label={l(user, "Primary navigation", "主要ナビゲーション")} style={{ display: "flex", background: "#fff", borderTop: "1px solid #e8e2d8", padding: "4px 0 8px", flexShrink: 0 }}>
         {["journey","lesson","profile"].map(function(id) {
           var labels = { journey: t(user, "journey"), lesson: t(user, "lesson"), profile: t(user, "profile") };
           var isActive = view === id;
-          return <button key={id} onClick={function() { handleTabClick(id); }} style={{ flex: 1, background: "none", border: "none", cursor: "pointer", padding: "8px 0 4px", display: "flex", flexDirection: "column", alignItems: "center", gap: 4 }}><div style={{ width: 5, height: 5, borderRadius: "50%", background: isActive ? "#4a3f33" : "transparent" }} /><span style={{ fontFamily: B, fontSize: 11, fontWeight: isActive ? 700 : 400, color: isActive ? "#3a3028" : "#a09488" }}>{labels[id]}</span></button>;
+          return <button type="button" aria-current={isActive ? "page" : undefined} key={id} onClick={function() { handleTabClick(id); }} style={{ flex: 1, background: "none", border: "none", cursor: "pointer", padding: "8px 0 4px", display: "flex", flexDirection: "column", alignItems: "center", gap: 4 }}><div style={{ width: 5, height: 5, borderRadius: "50%", background: isActive ? "#4a3f33" : "transparent" }} /><span style={{ fontFamily: B, fontSize: 11, fontWeight: isActive ? 700 : 400, color: isActive ? "#3a3028" : SOFT }}>{labels[id]}</span></button>;
         })}
-      </div>
+      </nav>
       {testMode && (
         <div style={{ background: "#c9a84c", padding: "4px 0", textAlign: "center", flexShrink: 0 }}>
           <span style={{ fontFamily: B, fontSize: 10, fontWeight: 700, color: "#fff", letterSpacing: 1 }}>TEST MODE \u2014 ALL DAYS UNLOCKED \u2014 NO COOLDOWN</span>
+        </div>
+      )}
+      {milestone && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(58,48,40,0.34)", display: "flex", alignItems: "center", justifyContent: "center", padding: 24, zIndex: 50 }}>
+          <div role="dialog" aria-modal="true" aria-labelledby="lumina-milestone-title" style={{ width: "100%", maxWidth: 360, background: "#fff", borderRadius: 22, padding: "26px 24px", textAlign: "center", boxShadow: "0 10px 32px rgba(0,0,0,0.18)" }}>
+            <div style={{ width: 64, height: 64, borderRadius: "50%", background: "linear-gradient(135deg, #e8d6b8, #f8f3eb)", margin: "0 auto 14px", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 28 }}>✦</div>
+            <p style={{ fontFamily: B, fontSize: 11, fontWeight: 700, letterSpacing: 2, color: MUTED, textTransform: "uppercase", marginBottom: 8 }}>{l(user, "Milestone", "節目")}</p>
+            <h3 id="lumina-milestone-title" style={{ fontFamily: F, fontSize: 28, fontWeight: 400, color: "#3a3028", marginBottom: 10 }}>{milestone.title}</h3>
+            <p style={{ fontFamily: B, fontSize: 14, color: "#5a4e40", lineHeight: 1.7, marginBottom: 18 }}>{milestone.body}</p>
+            <button type="button" onClick={function() { setMilestone(null); }} style={{ width: "100%", padding: "12px 0", borderRadius: 12, border: "none", background: "#4a3f33", color: "#fff", fontFamily: B, fontSize: 13, cursor: "pointer" }}>{l(user, "Continue", "続ける")}</button>
+          </div>
         </div>
       )}
     </div>

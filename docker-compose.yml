@@ -1,22 +1,4 @@
 services:
-  # ─── LUMINA's own PostgreSQL database ───
-  db:
-    image: postgres:17-alpine
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: ${DB_NAME:-lumina}
-      POSTGRES_USER: ${DB_USER:-lumina}
-      POSTGRES_PASSWORD: ${DB_PASS:?DB_PASS must be set in .env}
-    volumes:
-      - lumina_pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-lumina}"]
-      interval: 5s
-      timeout: 5s
-      start_period: 120s
-      retries: 30
-
-  # ─── LUMINA Node.js app ───
   app:
     build: .
     restart: unless-stopped
@@ -33,25 +15,24 @@ services:
       - "traefik.docker.network=coolify"
     networks:
       - coolify
-      - default
+      - namibarden-internal
     environment:
-      DB_HOST: db
-      DB_PORT: 5432
-      DB_NAME: ${DB_NAME:-lumina}
-      DB_USER: ${DB_USER:-lumina}
-      DB_PASS: ${DB_PASS:?DB_PASS must be set in .env}
-      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set in .env}
+      DB_HOST: ${DB_HOST:-namibarden-db}
+      DB_PORT: ${DB_PORT:-5432}
+      DB_NAME: ${DB_NAME:-namibarden}
+      DB_USER: ${DB_USER:-namibarden}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_SCHEMA: ${DB_SCHEMA:-lumina}
+      JWT_SECRET: ${JWT_SECRET:-change-this-to-random-string}
       NODE_ENV: production
       PORT: 3456
-    depends_on:
-      db:
-        condition: service_healthy
-
-volumes:
-  lumina_pgdata:
-    external: true
-    name: okw0cwwgskcow8k8o08gsok0_lumina-pgdata
+      APP_BASE_URL: ${APP_BASE_URL:-https://lumina.namibarden.com}
+      NAMI_API_BASE: ${NAMI_API_BASE:-https://namibarden.com/api/internal/lumina}
+      NAMI_LUMINA_BRIDGE_SECRET: ${NAMI_LUMINA_BRIDGE_SECRET}
+      LUMINA_ENABLE_TEST_USER: ${LUMINA_ENABLE_TEST_USER:-0}
 
 networks:
   coolify:
+    external: true
+  namibarden-internal:
     external: true
