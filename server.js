@@ -246,7 +246,7 @@ async function namiRequest(pathname, body) {
     });
   } catch (err) {
     console.error('[lumina] Billing service unreachable:', err.message);
-    return { error: 'Billing service unavailable' };
+    throw new Error('Billing service unavailable');
   }
 
   let data;

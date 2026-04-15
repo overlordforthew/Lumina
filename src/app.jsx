@@ -1951,12 +1951,14 @@ function LuminaApp() {
     }, { email: user && user.email });
     try {
       var session = await api.createBillingPortal(window.location.origin + "/");
-      if (session && session.url) {
-        window.location.href = session.url;
-        return;
+      if (!session || !session.url) {
+        throw new Error(l(user, "Billing portal is unavailable right now. Please try again.", "現在請求ポータルを開けません。しばらくしてからもう一度お試しください。"));
       }
-    } catch(e) {}
-    window.location.href = buildLuminaCheckoutUrl(user, "lumina-monthly");
+      window.location.href = session.url;
+    } catch(e) {
+      console.error('[lumina] Billing portal open failed:', e);
+      alert((e && e.message) || l(user, "Billing portal is unavailable right now. Please try again.", "現在請求ポータルを開けません。しばらくしてからもう一度お試しください。"));
+    }
   };
   var handleExportAccount = async function() {
     try {
