@@ -456,6 +456,17 @@ app.post(BASE + '/api/billing/portal', auth, async (req, res) => {
   }
 });
 
+app.post(BASE + '/api/internal/entitlement-cache-bust', async (req, res) => {
+  if (!NAMI_LUMINA_BRIDGE_SECRET) return res.status(503).json({ error: 'Bridge not configured' });
+  if (req.headers['x-lumina-bridge-key'] !== NAMI_LUMINA_BRIDGE_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  const email = normalizeEmail(req.body?.email);
+  if (!email) return res.status(400).json({ error: 'Email required' });
+  billingCache.delete(email);
+  res.json({ ok: true });
+});
+
 app.post(BASE + '/api/analytics/track', async (req, res) => {
   try {
     const ip = getIP(req);
@@ -654,7 +665,8 @@ app.post(BASE + '/api/account/delete', auth, async (req, res) => {
     const billing = await getBillingStatusForEmail(userRow.email, { force: true }).catch(() => null);
     const entitlement = billing && billing.entitlement ? billing.entitlement : null;
     const renewalStillActive = entitlement &&
-      ['active', 'trialing', 'past_due'].includes(String(entitlement.status || '').toLowerCase()) &&
+      entitlement.hasAccess &&
+      String(entitlement.status || '').toLowerCase() !== 'lifetime' &&
       !entitlement.cancelAt &&
       !entitlement.canceledAt;
     if (renewalStillActive) {

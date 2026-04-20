@@ -783,9 +783,11 @@ function BillingScreen(props) {
       activatingAccess: !!props.activatingAccess
     }, { email: user.email });
   }, [user && user.email, entitlement.status, entitlement.accessState, props.justActivated, props.activatingAccess]);
-  var statusCopy = entitlement.status
-    ? l(user, "Current state: " + entitlement.status, "現在の状態: " + entitlement.status)
-    : l(user, "Membership required to enter Lumina.", "Lumina を使うにはメンバーシップが必要です。");
+  var statusCopy = entitlement.status === "lifetime"
+    ? l(user, "Lifetime access — no renewal needed", "ライフタイムアクセス（更新不要）")
+    : entitlement.status
+      ? l(user, "Current state: " + entitlement.status, "現在の状態: " + entitlement.status)
+      : l(user, "Membership required to enter Lumina.", "Lumina を使うにはメンバーシップが必要です。");
   var card = function(planCode, priceEn, priceJa, subtitleEn, subtitleJa) {
     return (
       <button
@@ -1477,9 +1479,11 @@ function ProfileView(props) {
   var phaseDesc = t(user, phDescs[phaseIdx]);
   var phaseQuote = t(user, phQuotes[phaseIdx]);
   var cancelScheduled = !!(entitlement.cancelAt || entitlement.canceledAt);
-  var statusLabel = entitlement.hasAccess
-    ? l(user, "Active " + (entitlement.planCode === "annual" ? "annual" : "monthly") + " membership", (entitlement.planCode === "annual" ? "年額" : "月額") + "メンバーシップ利用中")
-    : l(user, "Membership inactive", "メンバーシップ停止中");
+  var statusLabel = entitlement.status === "lifetime"
+    ? l(user, "Lifetime access", "ライフタイムアクセス")
+    : entitlement.hasAccess
+      ? l(user, "Active " + (entitlement.planCode === "annual" ? "annual" : "monthly") + " membership", (entitlement.planCode === "annual" ? "年額" : "月額") + "メンバーシップ利用中")
+      : l(user, "Membership inactive", "メンバーシップ停止中");
 
   var handleExportClick = async function() {
     setAccountBusy("export");
@@ -1563,18 +1567,24 @@ function ProfileView(props) {
         <p style={{ fontFamily: B, fontSize: 12, fontWeight: 700, letterSpacing: 2, color: "#8a7e6e", textTransform: "uppercase", marginBottom: 8 }}>{l(user, "Membership", "メンバーシップ")}</p>
         <h3 style={{ fontFamily: F, fontSize: 22, fontWeight: 400, color: "#3a3028", marginBottom: 6 }}>{statusLabel}</h3>
         <p style={{ fontFamily: B, fontSize: 13, color: "#5a4e40", lineHeight: 1.6, marginBottom: 12 }}>
-          {entitlement.currentPeriodEnd
-            ? l(user, "Current period ends " + new Date(entitlement.currentPeriodEnd).toLocaleDateString(), "現在の利用期間終了日: " + new Date(entitlement.currentPeriodEnd).toLocaleDateString())
-            : l(user, "Billing is handled securely on namibarden.com.", "請求は namibarden.com で安全に管理されます。")}
+          {entitlement.status === "lifetime"
+            ? (entitlement.lifetimeGrantedAt
+                ? l(user, "Lifetime member since " + new Date(entitlement.lifetimeGrantedAt).toLocaleDateString(), "ライフタイムメンバー開始日: " + new Date(entitlement.lifetimeGrantedAt).toLocaleDateString())
+                : l(user, "Lifetime access — thank you for your one-time purchase.", "ライフタイムアクセス — ご購入ありがとうございます。"))
+            : entitlement.currentPeriodEnd
+              ? l(user, "Current period ends " + new Date(entitlement.currentPeriodEnd).toLocaleDateString(), "現在の利用期間終了日: " + new Date(entitlement.currentPeriodEnd).toLocaleDateString())
+              : l(user, "Billing is handled securely on namibarden.com.", "請求は namibarden.com で安全に管理されます。")}
         </p>
-        <div style={{ display: "flex", gap: 10 }}>
-          <button onClick={props.onOpenPortal} style={{ flex: 1, padding: "12px 0", borderRadius: 12, border: "1px solid #ddd3c6", background: "#fff", color: "#6b5e50", fontFamily: B, fontSize: 13, cursor: "pointer" }}>
-            {l(user, "Manage billing", "請求を管理")}
-          </button>
-          <button onClick={function() { props.onStartCheckout(entitlement.planCode === "annual" ? "lumina-annual" : "lumina-monthly"); }} style={{ flex: 1, padding: "12px 0", borderRadius: 12, border: "none", background: "#4a3f33", color: "#fff", fontFamily: B, fontSize: 13, cursor: "pointer" }}>
-            {entitlement.hasAccess ? l(user, "Open checkout", "決済ページを開く") : l(user, "Activate access", "アクセスを有効化")}
-          </button>
-        </div>
+        {entitlement.status !== "lifetime" && (
+          <div style={{ display: "flex", gap: 10 }}>
+            <button onClick={props.onOpenPortal} style={{ flex: 1, padding: "12px 0", borderRadius: 12, border: "1px solid #ddd3c6", background: "#fff", color: "#6b5e50", fontFamily: B, fontSize: 13, cursor: "pointer" }}>
+              {l(user, "Manage billing", "請求を管理")}
+            </button>
+            <button onClick={function() { props.onStartCheckout("lumina-lifetime"); }} style={{ flex: 1, padding: "12px 0", borderRadius: 12, border: "none", background: "#4a3f33", color: "#fff", fontFamily: B, fontSize: 13, cursor: "pointer" }}>
+              {l(user, "Purchase lifetime access", "ライフタイムアクセスを購入")}
+            </button>
+          </div>
+        )}
       </div>
 
       <div style={{ background: "#fff", borderRadius: 14, padding: 16, marginBottom: 16, boxShadow: "0 2px 8px rgba(0,0,0,0.03)" }}>
